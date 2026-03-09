@@ -38,6 +38,10 @@ function actualizarTodosStock(canal, sku, valor) {
     throw new Error('actualizarTodosStock: stock inválido para SKU ' + skuNorm);
   }
 
+  if (stockNuevo < 0) {
+    throw new Error('actualizarTodosStock: stock negativo bloqueado para SKU ' + skuNorm + ' -> ' + stockNuevo);
+  }
+
   if (!EHI_CHANNELS[canalOrigen]) {
     throw new Error('actualizarTodosStock: canal no reconocido -> ' + canalOrigen);
   }
@@ -113,6 +117,7 @@ function actualizarTodosStock(canal, sku, valor) {
 
 // ===================================================================
 // Determina si el SKU existe en el canal destino
+// Nota: usa búsqueda en memoria para mejorar performance
 // ===================================================================
 function skuExisteEnCanal_(canal, sku) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -156,13 +161,13 @@ function existeSkuEnHoja_(sheet, col, sku) {
 
   const values = sheet.getRange(2, col, lastRow - 1, 1).getValues();
   const skuNorm = String(sku || '').trim();
+  const skuSet = new Set(
+    values.map(function(row) {
+      return String(row[0] || '').trim();
+    })
+  );
 
-  for (let i = 0; i < values.length; i++) {
-    if (String(values[i][0] || '').trim() === skuNorm) {
-      return true;
-    }
-  }
-  return false;
+  return skuSet.has(skuNorm);
 }
 
 
