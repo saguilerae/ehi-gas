@@ -1,0 +1,62 @@
+// Variables Globales
+const UserAgent = "SC1DB59/Java/1.8/PROPIA/FACL";
+const ScApiHost = "https://sellercenter-api.falabella.com/";
+const HASH_ALGORITHM = "HmacSHA256";
+const CHAR_UTF_8 = "UTF-8";
+const CHAR_ASCII = "ASCII";
+
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('Importadora Elizalde')
+      .addItem('Registrar Venta', 'registrarVenta')
+      .addSeparator()
+      .addItem('Recalcular Saldo', 'calculaSaldo')
+      .addSeparator()
+      .addItem('Generar Respaldo', 'respaldoImportadoraElizalde')
+      .addSeparator()
+      .addItem('Probar Lógica Lead Time', 'lead_time_logic')
+      .addToUi();
+  ui.createMenu('Marketplace')
+      .addSubMenu(ui.createMenu('Mercado Libre')
+          .addItem('Consultar productos', 'consultaProdsML')
+          .addSeparator()
+          .addItem('Actualizar stock', 'actualizarStockML')
+          .addItem('Actualizar estado', 'actualizarEstadoML')
+          .addItem('Actualizar precios', 'actualizarPreciosML')
+          .addItem('Actualizar precios oferta', 'f')
+          .addSeparator()
+          .addItem('Solicitar Accesos', 'refreshMeliTokens')
+        )
+      .addSubMenu(ui.createMenu('Falabella')
+          .addItem('Consultar productos', 'consultaProdsFS')
+          .addSeparator()
+          .addItem('Actualizar stock', 'actualizarStockFS')
+          .addItem('Actualizar status', 'actualizarStatusFS')
+          .addItem('Actualizar precios', 'actualizarPreciosFS')
+          .addItem('Actualizar precios oferta', 'actualizarPreciosOfertaFS')
+        )
+      .addSubMenu(ui.createMenu('Paris')
+          .addItem('Consultar todo', 'paris_runAll_fetchs')
+          .addItem('Consultar precios', 'paris_fetchPrices_toSheet')
+          .addItem('Consultar productos', 'paris_fetchProducts_mapSkus')
+          .addSeparator()
+          .addItem('Actualizar stock', 'paris_updateStock_fromSheet')
+          .addItem('Actualizar precios', 'paris_updatePriceList_fromSheet')
+          .addItem('Actualizar precios oferta', 'paris_updatePriceOffer_fromSheet')
+          .addSeparator()
+          .addItem('Limpiar cache', 'paris_clearCache')
+          .addItem('Limpiar cache Parent Id', 'paris_clearParentIdCache_')
+        )
+      .addSubMenu(ui.createMenu('Shopify')
+          .addItem('Consultar productos', 'syncShopifyProductsToSheet')
+          .addSeparator()
+          .addItem('Actualizar stock', 'updateShopifyStockOnly')
+          .addItem('Actualizar status', 'updateShopifyStatusOnly')
+          .addItem('Actualizar precios', 'updateShopifyPriceOnly')
+          .addItem('Actualizar precios oferta', 'updateShopifyFromSheet')
+          .addSeparator()
+          .addItem('Actualizar título', 'updateShopifyTitlesFromSheet')
+          .addItem('Actualizar metacampos SEO', 'updateShopifySeoFromSheet')
+        )
+      .addToUi(); 
+}
