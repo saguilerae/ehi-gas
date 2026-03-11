@@ -990,3 +990,894 @@ function actualizarStockML_desdeParametros(skuObjetivo, stockNuevo) {
     actualizaProdML(arrUrlOpt);
   }
 }
+
+// ===================================================================
+// MLC Ventas - Ingesta histórica / incremental hacia hoja "Ventas MLC"
+// Fase actual:
+// - descarga histórico o incremental desde Mercado Libre
+// - escribe SOLO en hoja "Ventas MLC"
+// - NO inserta en hoja "Ventas"
+// - NO ejecuta registrarVenta()
+// - NO toca stock
+//
+// Requiere Script Properties:
+// MELI_ACCESS_TOKEN
+// MELI_USERID
+// MELI_LAST_SYNC
+//
+// Hoja destino:
+// "Ventas MLC"
+// Encabezados ya creados en fila 1
+// Escritura desde fila 2
+// ===================================================================
+
+const MLC_SHEET_VENTAS = 'Ventas MLC';
+const MLC_PAGE_LIMIT = 50;
+
+// -------------------------------------------------------------------
+// Entry point histórico
+// -------------------------------------------------------------------
+function ingestarVentasMLC_historico() {
+  return ingestarVentasMLC_({
+    modo: 'HISTORICO',
+    actualizarLastSync: false
+  });
+}
+
+// -------------------------------------------------------------------
+// Entry point incremental
+// -------------------------------------------------------------------
+function ingestarVentasMLC_incremental() {
+  return ingestarVentasMLC_({
+    modo: 'INCREMENTAL',
+    actualizarLastSync: true
+  });
+}
+
+// -------------------------------------------------------------------
+// Motor principal
+// -------------------------------------------------------------------
+function ingestarVentasMLC_(opts) {
+  opts = opts || {};
+
+  const modo = String(opts.modo || 'HISTORICO').toUpperCase();
+  const actualizarLastSync = !!opts.actualizarLastSync;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(MLC_SHEET_VENTAS);
+  if (!sh) throw new Error("No existe la hoja '" + MLC_SHEET_VENTAS + "'.");
+
+  const props = PropertiesService.getScriptProperties();
+  const shipmentCache = {}; 
+  const cfg = getMeliConfig_();
+  const sellerId = String(cfg.userId || '').trim();
+  const lastSyncProp = String(props.getProperty('MELI_LAST_SYNC') || '').trim();
+  const historicalFromProp = String(props.getProperty('MELI_HISTORICAL_FROM') || '').trim();
+
+  if (!sellerId) throw new Error('Falta MELI_USERID en Script Properties.');
+
+  const searchFrom = (modo === 'HISTORICO')
+    ? (historicalFromProp || MLC_DEFAULT_HISTORICAL_FROM)
+    : lastSyncProp;
+
+  if (modo === 'HISTORICO' && !historicalFromProp) {
+    throw new Error(
+      'Falta definir MELI_HISTORICAL_FROM en Script Properties.'
+    );
+  }
+
+  if (!searchFrom) {
+    throw new Error(
+      modo === 'HISTORICO'
+        ? 'No se pudo resolver fecha histórica base.'
+        : 'Falta MELI_LAST_SYNC en Script Properties.'
+    );
+  }
+
+  const headerMap = mlc_getHeaderMap_(sh);
+
+  if (!headerMap['clave_unica']) {
+    throw new Error("La hoja 'Ventas MLC' debe tener header 'clave_unica'.");
+  }
+
+  const existingKeys = mlc_getExistingKeys_(sh, headerMap['clave_unica']);
+
+  let offset = 0;
+  let totalFetchedOrders = 0;
+  let totalRowsPrepared = 0;
+  let totalRowsInserted = 0;
+  let maxDateCreatedSeen = lastSyncProp || searchFrom;
+  let shouldContinue = true;
+
+  SpreadsheetApp.getActive().toast('Ingesta MLC iniciada (' + modo + ')', 'EHI', 5);
+
+  while (shouldContinue) {
+    const searchResp = mlc_fetchOrdersPage_(sellerId, searchFrom, offset, MLC_PAGE_LIMIT);
+    const results = (searchResp && searchResp.results) ? searchResp.results : [];
+
+    if (!results.length) break;
+
+    totalFetchedOrders += results.length;
+
+    const rowsToAppend = [];
+
+    // Pre-fetch todos los shipments del lote en paralelo
+    var batchShipmentIds = [];
+    for (var pi = 0; pi < results.length; pi++) {
+      var shippingNode = results[pi] && results[pi].shipping ? results[pi].shipping : {};
+      var sid = String(shippingNode.id || '').trim();
+      if (sid && !Object.prototype.hasOwnProperty.call(shipmentCache, sid)) {
+        batchShipmentIds.push(sid);
+      }
+    }
+
+    // Mapa shipmentId → cantidad de órdenes que comparten ese shipment en este lote
+    var shipmentOrderCount = {};
+    for (var ci = 0; ci < results.length; ci++) {
+      var cShipping = results[ci] && results[ci].shipping ? results[ci].shipping : {};
+      var cSid = String(cShipping.id || '').trim();
+      if (cSid) {
+        shipmentOrderCount[cSid] = (shipmentOrderCount[cSid] || 0) + 1;
+      }
+    }
+
+    // Eliminar duplicados
+    batchShipmentIds = batchShipmentIds.filter(function(v, idx, arr) { return arr.indexOf(v) === idx; });
+    if (batchShipmentIds.length) {
+      var fetchedShipments = mlc_fetchShipmentsBatch_(batchShipmentIds);
+      Object.keys(fetchedShipments).forEach(function(k) { shipmentCache[k] = fetchedShipments[k]; });
+    }
+
+    for (var i = 0; i < results.length; i++) {
+      const order = results[i];
+      const dateCreated = mlc_safeIso_(order.date_created || order.date_closed || '');
+
+      if (dateCreated && dateCreated > maxDateCreatedSeen) {
+        maxDateCreatedSeen = dateCreated;
+      }
+
+      const rowsBuilt = mlc_buildRowsFromOrder_(order, headerMap, existingKeys, modo, shipmentCache, shipmentOrderCount);
+      totalRowsPrepared += rowsBuilt.length;
+
+      for (var j = 0; j < rowsBuilt.length; j++) {
+        rowsToAppend.push(rowsBuilt[j]);
+      }
+    }
+
+    if (rowsToAppend.length) {
+      const startRow = Math.max(sh.getLastRow() + 1, 2);
+      sh.getRange(startRow, 1, rowsToAppend.length, rowsToAppend[0].length).setValues(rowsToAppend);
+      totalRowsInserted += rowsToAppend.length;
+    }
+
+    if (results.length < MLC_PAGE_LIMIT) {
+      shouldContinue = false;
+    } else {
+      offset += MLC_PAGE_LIMIT;
+      Utilities.sleep(150);
+    }
+  }
+
+  if (actualizarLastSync && maxDateCreatedSeen && maxDateCreatedSeen !== lastSyncProp) {
+    props.setProperty('MELI_LAST_SYNC', maxDateCreatedSeen);
+  }
+
+  const resumen = {
+    modo: modo,
+    searchFrom: searchFrom,
+    fetchedOrders: totalFetchedOrders,
+    preparedRows: totalRowsPrepared,
+    insertedRows: totalRowsInserted,
+    lastSyncAnterior: lastSyncProp,
+    lastSyncNuevo: actualizarLastSync ? maxDateCreatedSeen : lastSyncProp
+  };
+
+  Logger.log('[MLC] Ingesta resumen: ' + JSON.stringify(resumen));
+  SpreadsheetApp.getActive().toast(
+    'MLC ' + modo + ': órdenes=' + totalFetchedOrders + ' | filas nuevas=' + totalRowsInserted,
+    'EHI',
+    7
+  );
+
+  return resumen;
+}
+
+// -------------------------------------------------------------------
+// Mercado Libre - búsqueda paginada de órdenes
+// -------------------------------------------------------------------
+function mlc_fetchOrdersPage_(sellerId, lastSyncIso, offset, limit) {
+  var url =
+    'https://api.mercadolibre.com/orders/search'
+    + '?seller=' + encodeURIComponent(sellerId)
+    + '&order.date_created.from=' + encodeURIComponent(lastSyncIso)
+    + '&sort=date_desc'
+    + '&offset=' + encodeURIComponent(offset)
+    + '&limit=' + encodeURIComponent(limit);
+
+  var resp = meliApiFetch_(url, { method: 'get' }, true);
+  var code = resp.getResponseCode();
+  var body = resp.getContentText();
+
+  if (code !== 200) {
+    throw new Error('ML orders/search error (' + code + '): ' + body);
+  }
+
+  return JSON.parse(body);
+}
+
+// -------------------------------------------------------------------
+// Construye filas destino desde una orden ML
+// Una fila por order_item
+// -------------------------------------------------------------------
+function mlc_buildRowsFromOrder_(order, headerMap, existingKeys, modo, shipmentCache, shipmentOrderCount) {
+  const rows = [];
+  const items = order && order.order_items ? order.order_items : [];
+  if (!items.length) return rows;
+
+  shipmentCache = shipmentCache || {};
+
+  const canal = 'ML';
+  const fechaIngesta = new Date();
+  const mlOrderId = mlc_toStr_(order.id);
+  const mlPackId = mlc_toStr_(order.pack_id);
+  const idVentaCanal = mlOrderId;
+  const fechaVenta = mlc_safeIso_(order.date_created || order.date_closed || '');
+  const estadoMl = mlc_toStr_(order.status);
+
+  const buyer = order && order.buyer ? order.buyer : {};
+  const payments = order && order.payments ? order.payments : [];
+  const shippingNode = order && order.shipping ? order.shipping : {};
+  const shipmentId = mlc_toStr_(shippingNode.id);
+
+  const shipment = shipmentId ? mlc_getShipmentCached_(shipmentId, shipmentCache) : null;
+  const region = mlc_extractRegion_(shipment);
+  const comuna = mlc_extractCity_(shipment);
+  const direccionResumen = mlc_extractAddress_(shipment);
+  const clienteNombre = mlc_resolveBuyerName_(buyer, shipment);
+
+  const totalOrderAmount = mlc_sumOrderItemsAmount_(items);
+  const cargoEnvioRaw     = mlc_resolveShipmentCost_(shipment, totalOrderAmount);
+  var   ordenesEnShipment = (shipmentId && shipmentOrderCount && shipmentOrderCount[shipmentId]) || 1;
+  const totalCargoEnvioOrden = (ordenesEnShipment > 1)
+    ? Math.round(cargoEnvioRaw / ordenesEnShipment)
+    : cargoEnvioRaw;
+
+  for (var i = 0; i < items.length; i++) {
+    const oi = items[i] || {};
+    const item = oi.item || {};
+
+    const mlItemId = mlc_toStr_(item.id);
+    const mlVariationId = mlc_toStr_(item.variation_id);
+    const skuCanal = mlc_resolveSkuCanal_(item);
+    const skuMaestro = skuCanal;
+    const mpn = '';
+
+    const cantidad = Number(oi.quantity || 0);
+    const precioUnitario = Number(oi.unit_price || 0);
+    const montoTotal = cantidad * precioUnitario;
+
+    const esCancelada  = (order.status === 'cancelled');
+    const esDevolucion = esCancelada
+      && (order.cancel_detail && order.cancel_detail.group === 'mediations')
+      && ((order.tags || []).indexOf('delivered') !== -1);
+
+    const soloAnularMontos = esCancelada && !esDevolucion;
+
+    const cargoVenta = soloAnularMontos ? 0 : mlc_resolveRowSaleFee_(oi, payments, montoTotal, totalOrderAmount);
+    const cargoEnvio = soloAnularMontos ? 0 : mlc_prorateAmount_(totalCargoEnvioOrden, montoTotal, totalOrderAmount);
+    const montoNeto  = soloAnularMontos ? 0 : montoTotal - cargoVenta - cargoEnvio;
+
+    const claveUnica = 'ML|' + mlOrderId + '|' + skuCanal;
+
+    if (existingKeys.has(claveUnica)) {
+      continue;
+    }
+    existingKeys.add(claveUnica);
+
+    const estadoConciliacion = esDevolucion        ? 'DEVOLUCION CON REEMBOLSO'
+                             : esCancelada         ? 'CANCELADA POR EL COMPRADOR'
+                             : (modo === 'HISTORICO') ? 'PENDIENTE_HISTORICO'
+                             : 'PENDIENTE';
+    const fechaConciliacion = '';
+    const mensajeConciliacion = '';
+    const existeEnVentas = 'NO';
+    const jsonRaw = JSON.stringify(order);
+    const observaciones = shipmentId && !shipment ? 'Sin detalle shipment' : '';
+
+    const row = mlc_buildEmptyRow_(headerMap);
+
+    mlc_setCell_(row, headerMap, 'fecha_ingesta', fechaIngesta);
+    mlc_setCell_(row, headerMap, 'canal', canal);
+    mlc_setCell_(row, headerMap, 'ml_order_id', mlOrderId);
+    mlc_setCell_(row, headerMap, 'ml_pack_id', mlPackId);
+    mlc_setCell_(row, headerMap, 'ml_item_id', mlItemId);
+    mlc_setCell_(row, headerMap, 'ml_variation_id', mlVariationId);
+    mlc_setCell_(row, headerMap, 'id_venta_canal', idVentaCanal);
+    mlc_setCell_(row, headerMap, 'fecha_venta', fechaVenta);
+    mlc_setCell_(row, headerMap, 'sku_canal', skuCanal);
+    mlc_setCell_(row, headerMap, 'sku_maestro', skuMaestro);
+    mlc_setCell_(row, headerMap, 'mpn', mpn);
+    mlc_setCell_(row, headerMap, 'cantidad', cantidad);
+    mlc_setCell_(row, headerMap, 'precio_unitario', precioUnitario);
+    mlc_setCell_(row, headerMap, 'monto_total', montoTotal);
+    mlc_setCell_(row, headerMap, 'cargo_venta', cargoVenta);
+    mlc_setCell_(row, headerMap, 'cargo_envio', cargoEnvio);
+    mlc_setCell_(row, headerMap, 'monto_neto', montoNeto);
+    mlc_setCell_(row, headerMap, 'cliente_nombre', clienteNombre);
+    mlc_setCell_(row, headerMap, 'region', region);
+    mlc_setCell_(row, headerMap, 'comuna', comuna);
+    mlc_setCell_(row, headerMap, 'direccion_resumen', direccionResumen);
+    mlc_setCell_(row, headerMap, 'estado_ml', estadoMl);
+    mlc_setCell_(row, headerMap, 'estado_conciliacion', estadoConciliacion);
+    mlc_setCell_(row, headerMap, 'fecha_conciliacion', fechaConciliacion);
+    mlc_setCell_(row, headerMap, 'mensaje_conciliacion', mensajeConciliacion);
+    mlc_setCell_(row, headerMap, 'clave_unica', claveUnica);
+    mlc_setCell_(row, headerMap, 'existe_en_ventas', existeEnVentas);
+    mlc_setCell_(row, headerMap, 'json_raw', jsonRaw);
+    mlc_setCell_(row, headerMap, 'observaciones', observaciones);
+
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+// -------------------------------------------------------------------
+// Helpers de hoja
+// -------------------------------------------------------------------
+function mlc_getHeaderMap_(sheet) {
+  const lastCol = sheet.getLastColumn();
+  if (lastCol < 1) throw new Error("La hoja '" + sheet.getName() + "' no tiene encabezados.");
+
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const map = {};
+
+  for (var i = 0; i < headers.length; i++) {
+    const h = String(headers[i] || '').trim();
+    if (h) map[h] = i + 1;
+  }
+
+  return map;
+}
+
+function mlc_getExistingKeys_(sheet, keyCol) {
+  const set = new Set();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return set;
+
+  const values = sheet.getRange(2, keyCol, lastRow - 1, 1).getValues();
+  for (var i = 0; i < values.length; i++) {
+    const key = String(values[i][0] || '').trim();
+    if (key) set.add(key);
+  }
+  return set;
+}
+
+function mlc_buildEmptyRow_(headerMap) {
+  const lastCol = Math.max.apply(null, Object.keys(headerMap).map(function(k) { return headerMap[k]; }));
+  const row = new Array(lastCol);
+  for (var i = 0; i < lastCol; i++) row[i] = '';
+  return row;
+}
+
+function mlc_setCell_(row, headerMap, headerName, value) {
+  const col = headerMap[headerName];
+  if (!col) return;
+  row[col - 1] = value;
+}
+
+// -------------------------------------------------------------------
+// Helpers ML
+// -------------------------------------------------------------------
+function mlc_toStr_(v) {
+  return String(v == null ? '' : v).trim();
+}
+
+function mlc_safeIso_(v) {
+  return String(v || '').trim();
+}
+
+function mlc_joinName_(firstName, lastName) {
+  return [mlc_toStr_(firstName), mlc_toStr_(lastName)].join(' ').trim();
+}
+
+function mlc_resolveSkuCanal_(item) {
+  if (!item) return '';
+
+  if (item.seller_custom_field) return mlc_toStr_(item.seller_custom_field);
+  if (item.seller_sku) return mlc_toStr_(item.seller_sku);
+  if (item.sku) return mlc_toStr_(item.sku);
+
+  const attrs = item.variation_attributes || item.attributes || [];
+  for (var i = 0; i < attrs.length; i++) {
+    const a = attrs[i] || {};
+    const id = mlc_toStr_(a.id).toUpperCase();
+    const name = mlc_toStr_(a.name).toUpperCase();
+    const valueName = mlc_toStr_(a.value_name);
+    const valueId = mlc_toStr_(a.value_id);
+
+    if (id === 'SELLER_SKU' || name === 'SELLER SKU') return valueName || valueId;
+    if (id === 'SKU' || name === 'SKU') return valueName || valueId;
+  }
+
+  return mlc_toStr_(item.id);
+}
+
+function mlc_sumFees_(payments) {
+  if (!payments || !payments.length) return 0;
+
+  var total = 0;
+  for (var i = 0; i < payments.length; i++) {
+    var p = payments[i] || {};
+
+    if (p.marketplace_fee != null) {
+      total += Number(p.marketplace_fee) || 0;
+    } else if (p.fee_amount != null) {
+      total += Number(p.fee_amount) || 0;
+    }
+  }
+  return total;
+}
+
+function mlc_extractRegion_(shipping) {
+  try {
+    return mlc_toStr_(
+      shipping.receiver_address &&
+      shipping.receiver_address.state &&
+      shipping.receiver_address.state.name
+    );
+  } catch (e) {
+    return '';
+  }
+}
+
+function mlc_extractCity_(shipping) {
+  try {
+    return mlc_toStr_(
+      shipping.receiver_address &&
+      shipping.receiver_address.city &&
+      shipping.receiver_address.city.name
+    );
+  } catch (e) {
+    return '';
+  }
+}
+
+function mlc_extractAddress_(shipping) {
+  try {
+    var ra = shipping.receiver_address || {};
+    var parts = [
+      mlc_toStr_(ra.address_line),
+      mlc_toStr_(ra.comment)
+    ].filter(function(x) { return x; });
+
+    return parts.join(' | ');
+  } catch (e) {
+    return '';
+  }
+}
+
+function mlc_buildVentaRowFromOrder_(order, canal) {
+
+  var orderId = order.id || '';
+  var fecha = order.date_created || '';
+  var estado = order.status || '';
+
+  var item = (order.order_items && order.order_items[0]) || {};
+  var product = item.item || {};
+
+  var sku = product.seller_sku || '';
+  var titulo = product.title || '';
+  var cantidad = item.quantity || 0;
+  var precio = item.unit_price || 0;
+
+  var payments = order.payments || [];
+  var shippingCost = '';
+  var cargoVenta = '';
+
+  if (payments.length) {
+    shippingCost = payments[0].shipping_cost || 0;
+  }
+
+  if (item.sale_fee != null) {
+    cargoVenta = item.sale_fee;
+  }
+
+  var buyer = order.buyer || {};
+  var clienteNombre = buyer.nickname || '';
+
+  return [
+    fecha,
+    '',                 // # Venta
+    sku,
+    precio,
+    cantidad,
+    canal || 'MLC',
+    cargoVenta,
+    shippingCost,
+    '',                 // tipo doc
+    '',                 // folio
+    '',                 // fecha boleta
+    orderId,
+    estado,
+    titulo,
+    JSON.stringify(order)   // json_raw
+  ];
+}
+
+function mlc_resolveBuyerName_(buyer, shipment) {
+  buyer   = buyer   || {};
+  shipment = shipment || {};
+
+  // 1. Nombre real desde dirección de entrega del shipment
+  var receiverName = shipment.receiver_address && shipment.receiver_address.receiver_name
+    ? mlc_toStr_(shipment.receiver_address.receiver_name)
+    : '';
+  if (receiverName) return receiverName;
+
+  // 2. Nombre desde buyer (si ML lo entrega)
+  var fullName = mlc_joinName_(buyer.first_name, buyer.last_name);
+  if (fullName) return fullName;
+
+  // 3. Fallback: nickname
+  if (buyer.nickname) return mlc_toStr_(buyer.nickname);
+
+  return '';
+}
+
+function mlc_sumSaleFees_(orderItems) {
+  if (!orderItems || !orderItems.length) return 0;
+
+  var total = 0;
+  for (var i = 0; i < orderItems.length; i++) {
+    var oi = orderItems[i] || {};
+    if (oi.sale_fee != null) {
+      total += Number(oi.sale_fee) || 0;
+    }
+  }
+  return total;
+}
+
+function mlc_sumShippingCost_(payments, order) {
+  var total = 0;
+
+  if (payments && payments.length) {
+    for (var i = 0; i < payments.length; i++) {
+      var p = payments[i] || {};
+      if (p.shipping_cost != null) {
+        total += Number(p.shipping_cost) || 0;
+      }
+    }
+  }
+
+  if (!total && order && order.shipping_cost != null) {
+    total = Number(order.shipping_cost) || 0;
+  }
+
+  return total;
+}
+
+function mlc_sumOrderItemsAmount_(orderItems) {
+  if (!orderItems || !orderItems.length) return 0;
+
+  var total = 0;
+  for (var i = 0; i < orderItems.length; i++) {
+    var oi = orderItems[i] || {};
+    var qty = Number(oi.quantity || 0);
+    var price = Number(oi.unit_price || 0);
+    total += qty * price;
+  }
+  return total;
+}
+
+function mlc_prorateAmount_(totalAmount, rowAmount, baseAmount) {
+  var total = Number(totalAmount || 0);
+  var row = Number(rowAmount || 0);
+  var base = Number(baseAmount || 0);
+
+  if (!total || !row || !base) return 0;
+  return Math.round((total * row / base) * 100) / 100;
+}
+
+function mlc_resolveRowSaleFee_(orderItem, payments, rowAmount, totalOrderAmount) {
+  orderItem = orderItem || {};
+
+  if (orderItem.sale_fee != null) {
+    var fee      = Number(orderItem.sale_fee) || 0;
+    var cantidad = Number(orderItem.quantity  || 1);
+    return fee * cantidad;
+  }
+
+  var totalFees = mlc_sumFees_(payments);
+  return mlc_prorateAmount_(totalFees, rowAmount, totalOrderAmount);
+}
+
+function mlc_resolveShipmentCost_(shipment, montoTotal) {
+  if (!shipment || typeof shipment !== 'object') {
+    Logger.log('[MLC shipment cost] shipment vacío o inválido');
+    return 0;
+  }
+
+  // Si el comprador pagó el envío (venta < 19990), el costo no es del vendedor
+  if ((montoTotal || 0) < 19990) {
+    Logger.log('[MLC shipment cost] comprador paga envío (monto < 19990), cargo_envio=0');
+    return 0;
+  }
+
+  // 1. shipping_option.list_cost = cargo real al vendedor en MLC
+  var listCost = shipment.shipping_option && shipment.shipping_option.list_cost;
+  if (listCost != null && listCost !== '') {
+    var lc = Number(listCost) || 0;
+    Logger.log('[MLC shipment cost] usando shipping_option.list_cost=' + lc);
+    return lc;
+  }
+
+  // 2. base_cost = fallback
+  if (shipment.base_cost != null && shipment.base_cost !== '') {
+    var baseCost = Number(shipment.base_cost) || 0;
+    Logger.log('[MLC shipment cost] usando base_cost=' + baseCost);
+    return baseCost;
+  }
+
+  Logger.log('[MLC shipment cost] no se encontró costo vendedor en shipment.id=' + (shipment.id || ''));
+  return 0;
+}
+
+// -------------------------------------------------------------------
+// Obtiene detalle de shipment desde Mercado Libre
+// -------------------------------------------------------------------
+function mlc_fetchShipment_(shipmentId) {
+  var id = String(shipmentId || '').trim();
+  if (!id) return null;
+
+  var url = 'https://api.mercadolibre.com/shipments/' + encodeURIComponent(id);
+
+  var resp = meliApiFetch_(url, { method: 'get' }, true);
+  var code = resp.getResponseCode();
+  var body = resp.getContentText();
+
+  if (code === 404) {
+    Logger.log('[MLC shipment] no encontrado: ' + id);
+    return null;
+  }
+
+  if (code !== 200) {
+    throw new Error('ML shipments/{id} error (' + code + '): ' + body);
+  }
+
+  var json = JSON.parse(body || '{}');
+  Logger.log('[MLC shipment] cargado: ' + id);
+
+  return json;
+}
+
+// -------------------------------------------------------------------
+// Obtiene múltiples shipments en paralelo (batches de 10)
+// Retorna {id: shipmentObj}
+// -------------------------------------------------------------------
+function mlc_fetchShipmentsBatch_(shipmentIds) {
+  var result = {};
+  var ids = (shipmentIds || []).filter(function(id) { return !!String(id || '').trim(); });
+  if (!ids.length) return result;
+
+  var BATCH = 10;
+  for (var i = 0; i < ids.length; i += BATCH) {
+    var batch = ids.slice(i, i + BATCH);
+    var requests = batch.map(function(sid) {
+      return { url: 'https://api.mercadolibre.com/shipments/' + encodeURIComponent(String(sid).trim()), method: 'get' };
+    });
+
+    var responses = meliApiFetchAll_(requests);
+
+    for (var j = 0; j < responses.length; j++) {
+      var sid = String(batch[j]).trim();
+      var resp = responses[j];
+      var code = resp.getResponseCode();
+      if (code === 200) {
+        try {
+          result[sid] = JSON.parse(resp.getContentText() || '{}');
+          Logger.log('[MLC shipment batch] cargado: ' + sid);
+        } catch(e) {
+          result[sid] = null;
+        }
+      } else if (code === 404) {
+        Logger.log('[MLC shipment batch] no encontrado: ' + sid);
+        result[sid] = null;
+      } else {
+        Logger.log('[MLC shipment batch] error (' + code + ') para id=' + sid);
+        result[sid] = null;
+      }
+    }
+
+    if (i + BATCH < ids.length) {
+      Utilities.sleep(200);
+    }
+  }
+
+  return result;
+}
+
+// -------------------------------------------------------------------
+// Cache local de shipments para no repetir llamadas
+// -------------------------------------------------------------------
+function mlc_getShipmentCached_(shipmentId, shipmentCache) {
+  var id = String(shipmentId || '').trim();
+  if (!id) return null;
+
+  shipmentCache = shipmentCache || {};
+
+  if (Object.prototype.hasOwnProperty.call(shipmentCache, id)) {
+    return shipmentCache[id];
+  }
+
+  var shipment = mlc_fetchShipment_(id);
+  shipmentCache[id] = shipment || null;
+
+  return shipmentCache[id];
+}
+
+// -------------------------------------------------------------------
+// Conciliación: cruza Ventas MLC contra hoja Ventas
+// Procesa: PENDIENTE, PENDIENTE_HISTORICO, DEVOLUCION CON REEMBOLSO
+// Omite:   CANCELADA POR EL COMPRADOR, CONCILIADA, DIFERENCIA
+// -------------------------------------------------------------------
+function mlc_conciliar() {
+  var ss         = SpreadsheetApp.getActiveSpreadsheet();
+  var sheetMLC   = ss.getSheetByName('Ventas MLC');
+  var sheetVentas = ss.getSheetByName('Ventas');
+
+  if (!sheetMLC)    throw new Error('Hoja "Ventas MLC" no encontrada');
+  if (!sheetVentas) throw new Error('Hoja "Ventas" no encontrada');
+
+  // --- Leer encabezados Ventas MLC ---
+  var headersMLC = sheetMLC.getRange(1, 1, 1, sheetMLC.getLastColumn()).getValues()[0];
+  var hMLC = {};
+  headersMLC.forEach(function(h, i) { hMLC[h] = i; });
+
+  var COL = {
+    mlOrderId          : hMLC['ml_order_id'],
+    mlPackId           : hMLC['ml_pack_id'],
+    skuCanal           : hMLC['sku_canal'],
+    montoTotal         : hMLC['monto_total'],
+    cargoVenta         : hMLC['cargo_venta'],
+    cargoEnvio         : hMLC['cargo_envio'],
+    montoNeto          : hMLC['monto_neto'],
+    estadoConciliacion : hMLC['estado_conciliacion'],
+    fechaConciliacion  : hMLC['fecha_conciliacion'],
+    mensajeConciliacion: hMLC['mensaje_conciliacion']
+  };
+
+  // --- Leer encabezados hoja Ventas ---
+  var headersV = sheetVentas.getRange(1, 1, 1, sheetVentas.getLastColumn()).getValues()[0];
+  var hV = {};
+  headersV.forEach(function(h, i) { hV[h] = i; });
+
+  var COLV = {
+    numVenta   : hV['# Venta'],
+    sku        : hV['SKU'],
+    precioVenta: hV['Precio\nVenta'],
+    cargosVenta: hV['Cargos por\nVenta'],
+    cargoEnvio : hV['Cargo por\nEnvío'],
+    recaudado  : hV['Recaudado']
+  };
+
+  // --- Construir mapas de hoja Ventas ---
+  var dataVentas = sheetVentas.getRange(2, 1, sheetVentas.getLastRow() - 1, sheetVentas.getLastColumn()).getValues();
+  var mapaVentas          = {};   // # Venta → fila
+  var mapaVentasCompuesto = {};   // # Venta|SKU → fila
+  dataVentas.forEach(function(row) {
+    var id = mlc_toStr_(row[COLV.numVenta]).trim();
+    if (!id) return;
+
+    // Ignorar notas de crédito (valores negativos)
+    var precioVenta = mlc_parseChileanNumber_(row[COLV.precioVenta]);
+    if (precioVenta < 0) return;
+
+    mapaVentas[id] = row;
+
+    var skuV = mlc_toStr_(row[COLV.sku]).trim();
+    if (skuV) {
+      mapaVentasCompuesto[id + '|' + skuV] = row;
+    }
+  });
+
+  // --- Leer filas Ventas MLC ---
+  var lastRow = sheetMLC.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('[MLC conciliar] Sin filas para procesar');
+    return;
+  }
+
+  var dataMLC = sheetMLC.getRange(2, 1, lastRow - 1, sheetMLC.getLastColumn()).getValues();
+
+  var ESTADOS_A_PROCESAR = {
+    'PENDIENTE'              : true,
+    'PENDIENTE_HISTORICO'    : true,
+    'DEVOLUCION CON REEMBOLSO': true
+  };
+
+  var TOLERANCIA = 1;
+  var fechaHoy   = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy');
+  var cambios    = 0;
+
+  for (var i = 0; i < dataMLC.length; i++) {
+    var fila        = dataMLC[i];
+    var estadoActual = mlc_toStr_(fila[COL.estadoConciliacion]).trim();
+
+    if (!ESTADOS_A_PROCESAR[estadoActual]) continue;
+
+    var mlOrderId = mlc_toStr_(fila[COL.mlOrderId]).trim();
+    var mlPackId  = mlc_toStr_(fila[COL.mlPackId]).trim();
+    var skuCanal  = mlc_toStr_(fila[COL.skuCanal]).trim();
+
+    // --- Buscar en hoja Ventas (jerarquía de 4 niveles) ---
+    var filaVenta = mapaVentas[mlOrderId]
+      || (mlPackId && skuCanal ? mapaVentasCompuesto[mlPackId + '|' + skuCanal] : null)
+      || (mlPackId ? mapaVentas[mlPackId] : null)
+      || null;
+
+    var nuevoEstado  = '';
+    var nuevoMensaje = '';
+
+    if (!filaVenta) {
+      nuevoEstado  = 'NO ENCONTRADA EN VENTAS';
+      nuevoMensaje = '';
+    } else {
+      // Normalizar valores MLC (enteros)
+      var mlMontoTotal  = Number(fila[COL.montoTotal])  || 0;
+      var mlCargoVenta  = Number(fila[COL.cargoVenta])  || 0;
+      var mlCargoEnvio  = Number(fila[COL.cargoEnvio])  || 0;
+      var mlMontoNeto   = Number(fila[COL.montoNeto])   || 0;
+
+      // Normalizar valores Ventas (formato "1.234" → 1234)
+      var vMontoTotal  = mlc_parseChileanNumber_(filaVenta[COLV.precioVenta]);
+      var vCargoVenta  = mlc_parseChileanNumber_(filaVenta[COLV.cargosVenta]);
+      var vCargoEnvio  = mlc_parseChileanNumber_(filaVenta[COLV.cargoEnvio]);
+      var vRecaudado   = mlc_parseChileanNumber_(filaVenta[COLV.recaudado]);
+
+      var diferencias = [];
+
+      if (Math.abs(mlMontoTotal - vMontoTotal) > TOLERANCIA)
+        diferencias.push('monto_total: ' + mlMontoTotal + ' vs ' + vMontoTotal);
+      if (Math.abs(mlCargoVenta - vCargoVenta) > TOLERANCIA)
+        diferencias.push('cargo_venta: ' + mlCargoVenta + ' vs ' + vCargoVenta);
+      if (Math.abs(mlCargoEnvio - vCargoEnvio) > TOLERANCIA)
+        diferencias.push('cargo_envio: ' + mlCargoEnvio + ' vs ' + vCargoEnvio);
+      if (Math.abs(mlMontoNeto - vRecaudado) > TOLERANCIA)
+        diferencias.push('monto_neto: ' + mlMontoNeto + ' vs ' + vRecaudado);
+
+      if (diferencias.length === 0) {
+        nuevoEstado  = 'CONCILIADA';
+        nuevoMensaje = 'OK';
+      } else {
+        nuevoEstado  = 'DIFERENCIA';
+        nuevoMensaje = diferencias.join(' | ');
+      }
+    }
+
+    // Escribir resultado en la fila
+    dataMLC[i][COL.estadoConciliacion]  = nuevoEstado;
+    dataMLC[i][COL.fechaConciliacion]   = fechaHoy;
+    dataMLC[i][COL.mensajeConciliacion] = nuevoMensaje;
+    cambios++;
+  }
+
+  // --- Escribir cambios de vuelta a la hoja ---
+  if (cambios > 0) {
+    sheetMLC.getRange(2, 1, dataMLC.length, dataMLC[0].length).setValues(dataMLC);
+    Logger.log('[MLC conciliar] Filas procesadas: ' + cambios);
+  } else {
+    Logger.log('[MLC conciliar] Sin filas para conciliar');
+  }
+
+  SpreadsheetApp.getActiveSpreadsheet().toast('Conciliación completada: ' + cambios + ' filas procesadas.', 'EHI - Conciliación ML');
+}
+
+// -------------------------------------------------------------------
+// Convierte string chileno "1.234" o número a entero
+// -------------------------------------------------------------------
+function mlc_parseChileanNumber_(val) {
+  if (val === null || val === undefined || val === '') return 0;
+  if (typeof val === 'number') return Math.round(val);
+  return parseInt(String(val).replace(/\./g, '').replace(/,.*$/, ''), 10) || 0;
+}

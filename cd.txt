@@ -1,5 +1,0 @@
-cd ~ && cd /Volumes/SanDisk/InnLabs/"00. Proyectos"/"E-Commerce Hub Intelligent (EHI)"/"03. Scripts"/"3.4. GAS EHI"
-
-clasp clone 1k4seLpfm9kjvIO1tAK-0hSe3_OfcEvJMCG0uBcVsaGuD3xQshKoFmxhi
-
-{"scriptId":"1k4seLpfm9kjvIO1tAK-0hSe3_OfcEvJMCG0uBcVsaGuD3xQshKoFmxhi","rootDir":"."}
