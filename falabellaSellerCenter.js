@@ -6,6 +6,13 @@
 // - getSellercenterApiResponse() corregido con headers
 // - payload solo en POST
 // ===================================================================
+// ── Variables Globales Falabella ────────────────────────────────
+const UserAgent      = "SC1DB59/Java/1.8/PROPIA/FACL";
+const ScApiHost      = "https://sellercenter-api.falabella.com/";
+const HASH_ALGORITHM = "HmacSHA256";
+const CHAR_UTF_8     = "UTF-8";
+const CHAR_ASCII     = "ASCII";
+// ===================================================================
 
 // Función: consultaProdsFS
 // Objetivo: consultar los productos del Falabella Seller Center
@@ -536,4 +543,374 @@ function xmlEscape_(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
+}
+
+
+// ===================================================================
+// VENTAS FSC — Ingesta de Órdenes Falabella Seller Center
+// Etapa 1: Ingesta (Histórica e Incremental)
+// ===================================================================
+
+// Constantes del módulo
+const FSC_SHEET_VENTAS    = 'Ventas FSC';
+const FSC_COMISION_RATE   = 0.20;
+const FSC_PAGE_LIMIT      = 100;
+const FSC_ITEMS_CHUNK     = 20;
+const FSC_PACING_MS       = 500;
+const FSC_LOG_HIST        = '[FSC-HIST]';
+const FSC_LOG_INC         = '[FSC-INC]';
+
+// Headers exactos de la hoja — 30 columnas
+const FSC_HEADERS = [
+  'fecha_ingesta','canal','fsc_order_id','fsc_order_number',
+  'fsc_order_item_id','fsc_package_id','id_venta_canal','fecha_venta',
+  'sku_canal','sku_maestro','mpn','cantidad',
+  'precio_unitario','monto_total','cargo_venta','cargo_envio',
+  'shipping_type','monto_neto','cliente_nombre','region',
+  'comuna','direccion_resumen','estado_fsc','estado_conciliacion',
+  'fecha_conciliacion','mensaje_conciliacion','clave_unica',
+  'existe_en_ventas','json_raw','observaciones'
+];
+
+// Estados de conciliación válidos (referencia)
+// PENDIENTE | PENDIENTE_HISTORICO | CANCELADA POR EL COMPRADOR |
+// DEVOLUCION CON REEMBOLSO | CONCILIADA | DIFERENCIA |
+// DIFERENCIA_CONOCIDA | NO ENCONTRADA EN VENTAS
+
+
+// ── Función pública menú: Ingesta Histórica ─────────────────────
+function fsc_ingestaHistorica() {
+  fsc_ingestarVentasFSC_({ modo: 'HISTORICO', actualizarLastSync: false });
+}
+
+// ── Función pública menú: Ingesta Incremental ───────────────────
+function fsc_ingestaIncremental() {
+  fsc_ingestarVentasFSC_({ modo: 'INCREMENTAL', actualizarLastSync: true });
+}
+
+
+// ── Orquestador principal ───────────────────────────────────────
+function fsc_ingestarVentasFSC_(opts) {
+  opts = opts || {};
+  const modo               = String(opts.modo || 'HISTORICO').toUpperCase();
+  const actualizarLastSync = !!opts.actualizarLastSync;
+  const logPrefix          = modo === 'HISTORICO' ? FSC_LOG_HIST : FSC_LOG_INC;
+
+  const props   = PropertiesService.getScriptProperties();
+  const cfg     = getFalabellaConfig_();
+  const lastSync = String(props.getProperty('FALABELLA_LAST_SYNC') || '').trim();
+
+  // Resolver fecha de búsqueda
+  let searchFrom = '';
+  if (modo === 'HISTORICO') {
+    searchFrom = lastSync;
+    if (!searchFrom) {
+      searchFrom = Browser.inputBox(
+        'Ingesta Histórica FSC',
+        'Ingresa fecha de inicio (YYYY-MM-DD):',
+        Browser.Buttons.OK_CANCEL
+      );
+      if (!searchFrom || searchFrom === 'cancel') {
+        SpreadsheetApp.getActive().toast('Ingesta cancelada.', 'FSC', 3);
+        return;
+      }
+    }
+  } else {
+    if (!lastSync) throw new Error('Falta FALABELLA_LAST_SYNC en Script Properties.');
+    searchFrom = lastSync;
+  }
+
+  // Obtener / crear hoja
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh   = ss.getSheetByName(FSC_SHEET_VENTAS);
+  if (!sh) sh = fsc_crearHojaVentasFSC_();
+
+  const headerMap    = fsc_getHeaderMap_(sh);
+  const existingKeys = fsc_getExistingKeys_(sh, headerMap['clave_unica']);
+
+  let offset              = 0;
+  let totalOrders         = 0;
+  let totalInserted       = 0;
+  let shouldContinue      = true;
+
+  SpreadsheetApp.getActive().toast('Ingesta FSC iniciada (' + modo + ')', 'EHI', 5);
+
+  while (shouldContinue) {
+    // 1. Traer página de órdenes
+    const orders = fsc_fetchOrders_(searchFrom, modo, offset);
+    if (!orders.length) break;
+    totalOrders += orders.length;
+
+    // 2. Extraer OrderIds del batch
+    const orderIds = orders.map(function(o) { return String(o.OrderId); });
+
+    // 3. Traer items para todos los OrderIds del batch
+    const itemsMap = fsc_fetchMultipleOrderItems_(orderIds, cfg);
+
+    // 4. Construir filas
+    const rowsToAppend = [];
+    for (var i = 0; i < orders.length; i++) {
+      const order = orders[i];
+      const orderId = String(order.OrderId);
+      const items   = itemsMap[orderId] || [];
+
+      for (var j = 0; j < items.length; j++) {
+        const clave = orderId + '-' + String(items[j].OrderItemId);
+        if (existingKeys.has(clave)) continue;        // evitar duplicados
+        const row = fsc_buildRow_(order, items[j], modo);
+        rowsToAppend.push(row);
+        existingKeys.add(clave);
+      }
+    }
+
+    // 5. Escribir batch en la hoja
+    if (rowsToAppend.length) {
+      const startRow = Math.max(sh.getLastRow() + 1, 2);
+      sh.getRange(startRow, 1, rowsToAppend.length, FSC_HEADERS.length)
+        .setValues(rowsToAppend);
+      totalInserted += rowsToAppend.length;
+    }
+
+    // 6. Paginación
+    if (orders.length < FSC_PAGE_LIMIT) {
+      shouldContinue = false;
+    } else {
+      offset += FSC_PAGE_LIMIT;
+      Utilities.sleep(FSC_PACING_MS);
+    }
+  }
+
+  // 7. Actualizar LAST_SYNC solo en incremental
+  if (actualizarLastSync) {
+    props.setProperty('FALABELLA_LAST_SYNC', new Date().toISOString());
+  }
+
+  const resumen = {
+    modo: modo, searchFrom: searchFrom,
+    fetchedOrders: totalOrders, insertedRows: totalInserted
+  };
+  Logger.log(logPrefix + ' Resumen: ' + JSON.stringify(resumen));
+  SpreadsheetApp.getActive().toast(
+    'FSC ' + modo + ': órdenes=' + totalOrders + ' | filas nuevas=' + totalInserted,
+    'EHI', 7
+  );
+  return resumen;
+}
+
+
+// ── Fetch órdenes paginadas ─────────────────────────────────────
+function fsc_fetchOrders_(searchFrom, modo, offset) {
+  try {
+    const cfg = getFalabellaConfig_();
+    const params = {
+      Action:       'GetOrders',
+      Format:       'JSON',
+      Version:      '2.0',
+      UserID:       cfg.userId,
+      Timestamp:    getCurrentTimestamp(),
+      Limit:        String(FSC_PAGE_LIMIT),
+      Offset:       String(offset),
+      SortDirection:'ASC'
+    };
+
+    // HISTORICO usa CreatedAfter, INCREMENTAL usa UpdatedAfter
+    if (modo === 'HISTORICO') {
+      params.CreatedAfter = searchFrom;
+    } else {
+      params.UpdatedAfter = searchFrom;
+    }
+
+    const raw  = getSellercenterApiResponse(params, cfg.apiKey, '', 'get');
+    const resp = JSON.parse(raw);
+
+    if (resp.ErrorResponse) {
+      Logger.log('[FSC] Error GetOrders: ' + JSON.stringify(resp.ErrorResponse));
+      return [];
+    }
+
+    let orders = [];
+    try {
+      orders = resp.SuccessResponse.Body.Orders.Order || [];
+    } catch(e) {
+      return [];
+    }
+
+    // Normalizar siempre a array
+    if (!Array.isArray(orders)) orders = [orders];
+    return orders;
+
+  } catch(e) {
+    Logger.log('[FSC] fsc_fetchOrders_ excepción: ' + e.message);
+    return [];
+  }
+}
+
+
+// ── Fetch items para múltiples órdenes en chunks ────────────────
+function fsc_fetchMultipleOrderItems_(orderIdList, cfg) {
+  cfg = cfg || getFalabellaConfig_();
+  const result = {};
+
+  for (var i = 0; i < orderIdList.length; i += FSC_ITEMS_CHUNK) {
+    const chunk = orderIdList.slice(i, i + FSC_ITEMS_CHUNK);
+    try {
+      const params = {
+        Action:      'GetMultipleOrderItems',
+        Format:      'JSON',
+        Version:     '1.0',
+        UserID:      cfg.userId,
+        Timestamp:   getCurrentTimestamp(),
+        OrderIdList: '[' + chunk.join(',') + ']'
+      };
+
+      const raw  = getSellercenterApiResponse(params, cfg.apiKey, '', 'get');
+      const resp = JSON.parse(raw);
+
+      if (resp.ErrorResponse) {
+        Logger.log('[FSC] Error GetMultipleOrderItems chunk: ' + JSON.stringify(resp.ErrorResponse));
+        continue;
+      }
+
+      let ordersResp = [];
+      try {
+        ordersResp = resp.SuccessResponse.Body.Orders.Order || [];
+      } catch(e) { continue; }
+
+      if (!Array.isArray(ordersResp)) ordersResp = [ordersResp];
+
+      ordersResp.forEach(function(o) {
+        const oid = String(o.OrderId);
+        let items = [];
+        try {
+          items = o.OrderItems.OrderItem || [];
+        } catch(e) { items = []; }
+        if (!Array.isArray(items)) items = [items];
+        result[oid] = items;
+      });
+
+    } catch(e) {
+      Logger.log('[FSC] fsc_fetchMultipleOrderItems_ chunk excepción: ' + e.message);
+    }
+
+    if (i + FSC_ITEMS_CHUNK < orderIdList.length) {
+      Utilities.sleep(FSC_PACING_MS);
+    }
+  }
+  return result;
+}
+
+
+// ── Construir una fila de 30 columnas ──────────────────────────
+function fsc_buildRow_(order, item, modo) {
+  const orderId     = String(order.OrderId    || '');
+  const orderItemId = String(item.OrderItemId || '');
+  const paidPrice   = parseFloat(item.PaidPrice      || 0);
+  const shippingAmt = parseFloat(item.ShippingAmount || 0);
+  const cargoVenta  = parseFloat((paidPrice * FSC_COMISION_RATE).toFixed(0));
+  const montoNeto   = parseFloat((paidPrice - cargoVenta - shippingAmt).toFixed(0));
+  const sku         = String(item.Sku || '');
+  const mpn         = sku.length > 2 ? sku.slice(0, -2) : sku;
+  const shippingType = String(item.ShippingType || '');
+  const isFBF       = shippingType === 'Own Warehouse';
+
+  // Estado conciliacion
+  let estadoConciliacion = '';
+  const estadoFsc = String(item.Status || '').toLowerCase();
+  if (estadoFsc === 'canceled') {
+    estadoConciliacion = 'CANCELADA POR EL COMPRADOR';
+  } else if (modo === 'HISTORICO') {
+    estadoConciliacion = 'PENDIENTE_HISTORICO';
+  } else {
+    estadoConciliacion = 'PENDIENTE';
+  }
+
+  return [
+    new Date(),                                           // A fecha_ingesta
+    'FS',                                                 // B canal
+    orderId,                                              // C fsc_order_id
+    String(order.OrderNumber    || ''),                   // D fsc_order_number
+    orderItemId,                                          // E fsc_order_item_id
+    String(item.PackageId       || ''),                   // F fsc_package_id
+    orderId + '-' + orderItemId,                          // G id_venta_canal
+    String(item.CreatedAt       || ''),                   // H fecha_venta
+    String(item.ShopSku         || ''),                   // I sku_canal
+    sku,                                                  // J sku_maestro
+    mpn,                                                  // K mpn
+    1,                                                    // L cantidad
+    parseFloat(item.ItemPrice   || 0),                    // M precio_unitario
+    paidPrice,                                            // N monto_total
+    cargoVenta,                                           // O cargo_venta
+    shippingAmt,                                          // P cargo_envio
+    shippingType,                                         // Q shipping_type
+    montoNeto,                                            // R monto_neto
+    String((order.CustomerFirstName || '') + ' ' +
+           (order.CustomerLastName  || '')).trim(),       // S cliente_nombre
+    fsc_safeAddr_(order, 'State'),                        // T region
+    fsc_safeAddr_(order, 'City'),                         // U comuna
+    fsc_safeAddr_(order, 'Address1'),                     // V direccion_resumen
+    String(item.Status          || ''),                   // W estado_fsc
+    estadoConciliacion,                                   // X estado_conciliacion
+    '',                                                   // Y fecha_conciliacion
+    '',                                                   // Z mensaje_conciliacion
+    orderId + '-' + orderItemId,                          // AA clave_unica
+    false,                                                // AB existe_en_ventas
+    JSON.stringify({ order_id: orderId, item: item }),    // AC json_raw
+    isFBF ? 'FBF - no consume stock' : ''                // AD observaciones
+  ];
+}
+
+
+// ── Helper dirección segura ─────────────────────────────────────
+function fsc_safeAddr_(order, field) {
+  try {
+    return String(order.AddressShipping[field] || '');
+  } catch(e) {
+    return '';
+  }
+}
+
+
+// ── Helper: mapa de headers ─────────────────────────────────────
+function fsc_getHeaderMap_(sh) {
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  const map = {};
+  headers.forEach(function(h, i) { if (h) map[String(h).trim()] = i; });
+  return map;
+}
+
+
+// ── Helper: claves únicas existentes ───────────────────────────
+function fsc_getExistingKeys_(sh, colIndex) {
+  const set = new Set();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2 || colIndex === undefined) return set;
+  const vals = sh.getRange(2, colIndex + 1, lastRow - 1, 1).getValues();
+  vals.forEach(function(r) { if (r[0]) set.add(String(r[0])); });
+  return set;
+}
+
+
+// ── Crear hoja Ventas FSC si no existe ─────────────────────────
+function fsc_crearHojaVentasFSC_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh   = ss.getSheetByName(FSC_SHEET_VENTAS);
+  if (sh) return sh;
+
+  sh = ss.insertSheet(FSC_SHEET_VENTAS);
+  sh.getRange(1, 1, 1, FSC_HEADERS.length).setValues([FSC_HEADERS]);
+  sh.setFrozenRows(1);
+
+  // Formato fecha cols A(1) y H(8)
+  sh.getRange(2, 1, sh.getMaxRows() - 1, 1)
+    .setNumberFormat('dd/mm/yyyy hh:mm:ss');
+  sh.getRange(2, 8, sh.getMaxRows() - 1, 1)
+    .setNumberFormat('dd/mm/yyyy hh:mm:ss');
+
+  // Formato número cols M(13),N(14),O(15),P(16),R(18)
+  [13, 14, 15, 16, 18].forEach(function(c) {
+    sh.getRange(2, c, sh.getMaxRows() - 1, 1)
+      .setNumberFormat('#,##0');
+  });
+
+  return sh;
 }

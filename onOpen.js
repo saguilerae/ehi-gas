@@ -1,10 +1,3 @@
-// Variables Globales
-const UserAgent = "SC1DB59/Java/1.8/PROPIA/FACL";
-const ScApiHost = "https://sellercenter-api.falabella.com/";
-const HASH_ALGORITHM = "HmacSHA256";
-const CHAR_UTF_8 = "UTF-8";
-const CHAR_ASCII = "ASCII";
-
 function onOpen() {
   var ui = SpreadsheetApp.getUi();
   ui.createMenu('Importadora Elizalde')
@@ -33,6 +26,10 @@ function onOpen() {
         )
       .addSubMenu(ui.createMenu('Falabella')
           .addItem('Consultar productos', 'consultaProdsFS')
+          .addSeparator()
+          .addItem('Consultar ventas histórico', 'fsc_ingestaHistorica')
+          .addItem('Consultar ventas incremental', 'fsc_ingestaIncremental')
+          .addItem('Conciliar ventas', 'fsc_conciliar')
           .addSeparator()
           .addItem('Actualizar stock', 'actualizarStockFS')
           .addItem('Actualizar status', 'actualizarStatusFS')
