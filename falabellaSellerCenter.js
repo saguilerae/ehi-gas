@@ -555,7 +555,6 @@ function xmlEscape_(value) {
 const FSC_SHEET_VENTAS    = 'Ventas FSC';
 const FSC_COMISION_RATE   = 0.20;
 const FSC_PAGE_LIMIT      = 100;
-const FSC_ITEMS_CHUNK     = 20;
 const FSC_PACING_MS       = 500;
 const FSC_LOG_HIST        = '[FSC-HIST]';
 const FSC_LOG_INC         = '[FSC-INC]';
@@ -579,48 +578,107 @@ const FSC_HEADERS = [
 
 
 // ── Función pública menú: Ingesta Histórica ─────────────────────
+// Usa ventanas de 30 días desde FALABELLA_HISTORICAL_FROM hasta hoy.
+// Única estrategia válida para FSC: UpdatedAfter con rango largo retorna 0.
 function fsc_ingestaHistorica() {
-  fsc_ingestarVentasFSC_({ modo: 'HISTORICO', actualizarLastSync: false });
+  const props          = PropertiesService.getScriptProperties();
+  const historicalFrom = String(props.getProperty('FALABELLA_HISTORICAL_FROM') || '').trim();
+
+  if (!historicalFrom) {
+    SpreadsheetApp.getActive().toast('Falta FALABELLA_HISTORICAL_FROM en Script Properties.', 'FSC', 5);
+    return;
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh   = ss.getSheetByName(FSC_SHEET_VENTAS);
+  if (!sh) sh = fsc_crearHojaVentasFSC_();
+
+  const headerMap    = fsc_getHeaderMap_(sh);
+  const existingKeys = fsc_getExistingKeys_(sh, headerMap['clave_unica']);
+  const cfg          = getFalabellaConfig_();
+
+  let desde          = new Date(historicalFrom);
+  const hasta        = new Date();
+  const VENTANA_DIAS = 30;
+  let totalOrders    = 0;
+  let totalInserted  = 0;
+  let ventana        = 0;
+
+  SpreadsheetApp.getActive().toast('Ingesta histórica FSC iniciada...', 'EHI', 5);
+
+  while (desde < hasta) {
+    const fin     = new Date(desde);
+    fin.setDate(fin.getDate() + VENTANA_DIAS);
+    const finReal = fin > hasta ? hasta : fin;
+
+    const updatedAfter  = fsc_normalizeDate_(desde.toISOString());
+    const updatedBefore = fsc_normalizeDate_(finReal.toISOString());
+
+    ventana++;
+    Logger.log(FSC_LOG_HIST + ' Ventana ' + ventana + ': ' + updatedAfter + ' → ' + updatedBefore);
+
+    let offset         = 0;
+    let shouldContinue = true;
+
+    while (shouldContinue) {
+      const orders = fsc_fetchOrdersVentana_(updatedAfter, updatedBefore, offset, cfg);
+      if (!orders.length) break;
+      totalOrders += orders.length;
+
+      const orderIds = orders.map(function(o) { return String(o.OrderId); });
+      const itemsMap = fsc_fetchOrderItems_(orderIds, cfg);
+
+      const rowsToAppend = [];
+      for (var i = 0; i < orders.length; i++) {
+        const order = orders[i];
+        const oid   = String(order.OrderId);
+        const items = itemsMap[oid] || [];
+        for (var j = 0; j < items.length; j++) {
+          const clave = oid + '-' + String(items[j].OrderItemId);
+          if (existingKeys.has(clave)) continue;
+          rowsToAppend.push(fsc_buildRow_(order, items[j], 'HISTORICO'));
+          existingKeys.add(clave);
+        }
+      }
+
+      if (rowsToAppend.length) {
+        const startRow = Math.max(sh.getLastRow() + 1, 2);
+        sh.getRange(startRow, 1, rowsToAppend.length, FSC_HEADERS.length).setValues(rowsToAppend);
+        totalInserted += rowsToAppend.length;
+      }
+
+      if (orders.length < FSC_PAGE_LIMIT) {
+        shouldContinue = false;
+      } else {
+        offset += FSC_PAGE_LIMIT;
+        Utilities.sleep(FSC_PACING_MS);
+      }
+    }
+
+    desde = fin;
+    Utilities.sleep(FSC_PACING_MS);
+  }
+
+  const resumen = { ventanas: ventana, fetchedOrders: totalOrders, insertedRows: totalInserted };
+  Logger.log(FSC_LOG_HIST + ' Resumen: ' + JSON.stringify(resumen));
+  SpreadsheetApp.getActive().toast(
+    'FSC histórico: ventanas=' + ventana + ' | órdenes=' + totalOrders + ' | filas=' + totalInserted,
+    'EHI', 10
+  );
+  return resumen;
 }
+
 
 // ── Función pública menú: Ingesta Incremental ───────────────────
 function fsc_ingestaIncremental() {
-  fsc_ingestarVentasFSC_({ modo: 'INCREMENTAL', actualizarLastSync: true });
-}
-
-
-// ── Orquestador principal ───────────────────────────────────────
-function fsc_ingestarVentasFSC_(opts) {
-  opts = opts || {};
-  const modo               = String(opts.modo || 'HISTORICO').toUpperCase();
-  const actualizarLastSync = !!opts.actualizarLastSync;
-  const logPrefix          = modo === 'HISTORICO' ? FSC_LOG_HIST : FSC_LOG_INC;
-
-  const props   = PropertiesService.getScriptProperties();
-  const cfg     = getFalabellaConfig_();
+  const props    = PropertiesService.getScriptProperties();
   const lastSync = String(props.getProperty('FALABELLA_LAST_SYNC') || '').trim();
 
-  // Resolver fecha de búsqueda
-  let searchFrom = '';
-  if (modo === 'HISTORICO') {
-    searchFrom = lastSync;
-    if (!searchFrom) {
-      searchFrom = Browser.inputBox(
-        'Ingesta Histórica FSC',
-        'Ingresa fecha de inicio (YYYY-MM-DD):',
-        Browser.Buttons.OK_CANCEL
-      );
-      if (!searchFrom || searchFrom === 'cancel') {
-        SpreadsheetApp.getActive().toast('Ingesta cancelada.', 'FSC', 3);
-        return;
-      }
-    }
-  } else {
-    if (!lastSync) throw new Error('Falta FALABELLA_LAST_SYNC en Script Properties.');
-    searchFrom = lastSync;
-  }
+  if (!lastSync) throw new Error('Falta FALABELLA_LAST_SYNC en Script Properties.');
 
-  // Obtener / crear hoja
+  const cfg          = getFalabellaConfig_();
+  const searchFrom   = fsc_normalizeDate_(lastSync);
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sh   = ss.getSheetByName(FSC_SHEET_VENTAS);
   if (!sh) sh = fsc_crearHojaVentasFSC_();
@@ -628,53 +686,40 @@ function fsc_ingestarVentasFSC_(opts) {
   const headerMap    = fsc_getHeaderMap_(sh);
   const existingKeys = fsc_getExistingKeys_(sh, headerMap['clave_unica']);
 
-  let offset              = 0;
-  let totalOrders         = 0;
-  let totalInserted       = 0;
-  let shouldContinue      = true;
+  let offset         = 0;
+  let totalOrders    = 0;
+  let totalInserted  = 0;
+  let shouldContinue = true;
 
-  SpreadsheetApp.getActive().toast('Ingesta FSC iniciada (' + modo + ')', 'EHI', 5);
-  
-  // Normalizar formato fecha para API FSC
-  searchFrom = fsc_normalizeDate_(searchFrom);
+  SpreadsheetApp.getActive().toast('Ingesta incremental FSC iniciada...', 'EHI', 5);
 
   while (shouldContinue) {
-    // 1. Traer página de órdenes
-    const orders = fsc_fetchOrders_(searchFrom, modo, offset);
+    const orders = fsc_fetchOrdersVentana_(searchFrom, null, offset, cfg);
     if (!orders.length) break;
     totalOrders += orders.length;
 
-    // 2. Extraer OrderIds del batch
     const orderIds = orders.map(function(o) { return String(o.OrderId); });
+    const itemsMap = fsc_fetchOrderItems_(orderIds, cfg);
 
-    // 3. Traer items para todos los OrderIds del batch
-    const itemsMap = fsc_fetchMultipleOrderItems_(orderIds, cfg);
-
-    // 4. Construir filas
     const rowsToAppend = [];
     for (var i = 0; i < orders.length; i++) {
       const order = orders[i];
-      const orderId = String(order.OrderId);
-      const items   = itemsMap[orderId] || [];
-
+      const oid   = String(order.OrderId);
+      const items = itemsMap[oid] || [];
       for (var j = 0; j < items.length; j++) {
-        const clave = orderId + '-' + String(items[j].OrderItemId);
-        if (existingKeys.has(clave)) continue;        // evitar duplicados
-        const row = fsc_buildRow_(order, items[j], modo);
-        rowsToAppend.push(row);
+        const clave = oid + '-' + String(items[j].OrderItemId);
+        if (existingKeys.has(clave)) continue;
+        rowsToAppend.push(fsc_buildRow_(order, items[j], 'INCREMENTAL'));
         existingKeys.add(clave);
       }
     }
 
-    // 5. Escribir batch en la hoja
     if (rowsToAppend.length) {
       const startRow = Math.max(sh.getLastRow() + 1, 2);
-      sh.getRange(startRow, 1, rowsToAppend.length, FSC_HEADERS.length)
-        .setValues(rowsToAppend);
+      sh.getRange(startRow, 1, rowsToAppend.length, FSC_HEADERS.length).setValues(rowsToAppend);
       totalInserted += rowsToAppend.length;
     }
 
-    // 6. Paginación
     if (orders.length < FSC_PAGE_LIMIT) {
       shouldContinue = false;
     } else {
@@ -683,45 +728,36 @@ function fsc_ingestarVentasFSC_(opts) {
     }
   }
 
-  // 7. Actualizar LAST_SYNC solo en incremental
-  if (actualizarLastSync) {
-    props.setProperty('FALABELLA_LAST_SYNC', new Date().toISOString());
-  }
+  props.setProperty('FALABELLA_LAST_SYNC', new Date().toISOString());
 
-  const resumen = {
-    modo: modo, searchFrom: searchFrom,
-    fetchedOrders: totalOrders, insertedRows: totalInserted
-  };
-  Logger.log(logPrefix + ' Resumen: ' + JSON.stringify(resumen));
+  const resumen = { searchFrom: searchFrom, fetchedOrders: totalOrders, insertedRows: totalInserted };
+  Logger.log(FSC_LOG_INC + ' Resumen: ' + JSON.stringify(resumen));
   SpreadsheetApp.getActive().toast(
-    'FSC ' + modo + ': órdenes=' + totalOrders + ' | filas nuevas=' + totalInserted,
+    'FSC incremental: órdenes=' + totalOrders + ' | filas nuevas=' + totalInserted,
     'EHI', 7
   );
   return resumen;
 }
 
 
-// ── Fetch órdenes paginadas ─────────────────────────────────────
-function fsc_fetchOrders_(searchFrom, modo, offset) {
+// ── Fetch órdenes con ventana UpdatedAfter [+ UpdatedBefore] ────
+function fsc_fetchOrdersVentana_(updatedAfter, updatedBefore, offset, cfg) {
   try {
-    const cfg = getFalabellaConfig_();
+    cfg = cfg || getFalabellaConfig_();
     const params = {
-      Action:       'GetOrders',
-      Format:       'JSON',
-      Version:      '1.0',
-      UserID:       cfg.userId,
-      Timestamp:    getCurrentTimestamp(),
-      Limit:        String(FSC_PAGE_LIMIT),
-      Offset:       String(offset),
-      SortDirection:'ASC'
+      Action:        'GetOrders',
+      Format:        'JSON',
+      Limit:         String(FSC_PAGE_LIMIT),
+      Offset:        String(offset),
+      SortDirection: 'ASC',
+      Timestamp:     getCurrentTimestamp(),
+      UpdatedAfter:  updatedAfter,
+      UserID:        cfg.userId,
+      Version:       '1.0'
     };
 
-    // HISTORICO usa CreatedAfter, INCREMENTAL usa UpdatedAfter
-    if (modo === 'HISTORICO') {
-      params.CreatedAfter = searchFrom;
-    } else {
-      params.UpdatedAfter = searchFrom;
-    }
+    // UpdatedBefore es opcional — solo se usa en histórico
+    if (updatedBefore) params.UpdatedBefore = updatedBefore;
 
     const raw  = getSellercenterApiResponse(params, cfg.apiKey, '', 'get');
     const resp = JSON.parse(raw);
@@ -732,111 +768,76 @@ function fsc_fetchOrders_(searchFrom, modo, offset) {
     }
 
     let orders = [];
-    try {
-      orders = resp.SuccessResponse.Body.Orders.Order || [];
-    } catch(e) {
-      return [];
-    }
-
-    // Normalizar siempre a array
+    try { orders = resp.SuccessResponse.Body.Orders.Order || []; } catch(e) { return []; }
     if (!Array.isArray(orders)) orders = [orders];
     return orders;
 
   } catch(e) {
-    Logger.log('[FSC] fsc_fetchOrders_ excepción: ' + e.message);
+    Logger.log('[FSC] fsc_fetchOrdersVentana_ excepción: ' + e.message);
     return [];
   }
 }
 
 
-// ── Fetch items para múltiples órdenes en chunks ────────────────
-// ── Fetch items para múltiples órdenes en chunks ────────────────
-function fsc_fetchMultipleOrderItems_(orderIdList, cfg) {
+// ── Fetch items por orden — loop de GetOrderItems ───────────────
+function fsc_fetchOrderItems_(orderIdList, cfg) {
   cfg = cfg || getFalabellaConfig_();
   const result = {};
 
-  for (var i = 0; i < orderIdList.length; i += FSC_ITEMS_CHUNK) {
-    const chunk = orderIdList.slice(i, i + FSC_ITEMS_CHUNK);
+  for (var i = 0; i < orderIdList.length; i++) {
+    const orderId = orderIdList[i];
     try {
-      // Construir params SIN OrderIdList — no debe entrar en la firma
       const params = {
-        Action:    'GetMultipleOrderItems',
+        Action:    'GetOrderItems',
         Format:    'JSON',
-        Version:   '1.0',
+        OrderId:   String(orderId),
+        Timestamp: getCurrentTimestamp(),
         UserID:    cfg.userId,
-        Timestamp: getCurrentTimestamp()
+        Version:   '1.0'
       };
 
-      // Construir firma manualmente (OrderIdList se agrega DESPUÉS de la firma)
-      const sortedParams = Object.keys(params).sort().reduce(function(acc, key) {
-        acc[key] = params[key];
-        return acc;
-      }, {});
-      const qs        = toQueryString(sortedParams);
-      const signature = hmacDigest(qs, cfg.apiKey, HASH_ALGORITHM);
-      const finalUrl  = ScApiHost + '?' + qs
-                      + '&Signature='   + encodeURIComponent(signature)
-                      + '&OrderIdList=' + encodeURIComponent('[' + chunk.join(',') + ']');
-
-      const response = UrlFetchApp.fetch(finalUrl, {
-        method:             'get',
-        muteHttpExceptions: true,
-        headers:            { 'User-Agent': UserAgent }
-      });
-      const raw  = response.getContentText();
+      const raw  = getSellercenterApiResponse(params, cfg.apiKey, '', 'get');
       const resp = JSON.parse(raw);
 
       if (resp.ErrorResponse) {
-        Logger.log('[FSC] Error GetMultipleOrderItems chunk: ' + JSON.stringify(resp.ErrorResponse));
+        Logger.log('[FSC] Error GetOrderItems [' + orderId + ']: ' + JSON.stringify(resp.ErrorResponse));
         continue;
       }
 
-      let ordersResp = [];
-      try {
-        ordersResp = resp.SuccessResponse.Body.Orders.Order || [];
-      } catch(e) { continue; }
-
-      if (!Array.isArray(ordersResp)) ordersResp = [ordersResp];
-
-      ordersResp.forEach(function(o) {
-        const oid = String(o.OrderId);
-        let items = [];
-        try {
-          items = o.OrderItems.OrderItem || [];
-        } catch(e) { items = []; }
-        if (!Array.isArray(items)) items = [items];
-        result[oid] = items;
-      });
+      let items = [];
+      try { items = resp.SuccessResponse.Body.OrderItems.OrderItem || []; } catch(e) { items = []; }
+      if (!Array.isArray(items)) items = [items];
+      result[String(orderId)] = items;
 
     } catch(e) {
-      Logger.log('[FSC] fsc_fetchMultipleOrderItems_ chunk excepción: ' + e.message);
+      Logger.log('[FSC] fsc_fetchOrderItems_ excepción [' + orderId + ']: ' + e.message);
     }
 
-    if (i + FSC_ITEMS_CHUNK < orderIdList.length) {
-      Utilities.sleep(FSC_PACING_MS);
-    }
+    Utilities.sleep(FSC_PACING_MS);
   }
   return result;
 }
 
+
 // ── Construir una fila de 30 columnas ──────────────────────────
 function fsc_buildRow_(order, item, modo) {
-  const orderId     = String(order.OrderId    || '');
-  const orderItemId = String(item.OrderItemId || '');
-  const paidPrice   = parseFloat(item.PaidPrice      || 0);
-  const shippingAmt = parseFloat(item.ShippingAmount || 0);
-  const cargoVenta  = parseFloat((paidPrice * FSC_COMISION_RATE).toFixed(0));
-  const montoNeto   = parseFloat((paidPrice - cargoVenta - shippingAmt).toFixed(0));
-  const sku         = String(item.Sku || '');
-  const mpn         = sku.length > 2 ? sku.slice(0, -2) : sku;
+  const orderId      = String(order.OrderId    || '');
+  const orderItemId  = String(item.OrderItemId || '');
+  const paidPrice    = parseFloat(item.PaidPrice      || 0);
+  const shippingAmt  = parseFloat(item.ShippingAmount || 0);
+  const cargoVenta   = parseFloat((paidPrice * FSC_COMISION_RATE).toFixed(0));
+  const montoNeto    = parseFloat((paidPrice - cargoVenta - shippingAmt).toFixed(0));
+  const sku          = String(item.Sku || '');
+  const mpn          = sku.length > 2 ? sku.slice(0, -2) : sku;
   const shippingType = String(item.ShippingType || '');
-  const isFBF       = shippingType === 'Own Warehouse';
+  const isFBF        = shippingType === 'Own Warehouse';
 
-  // Estado conciliacion
-  let estadoConciliacion = '';
   const estadoFsc = String(item.Status || '').toLowerCase();
+  let estadoConciliacion = '';
   if (estadoFsc === 'canceled') {
     estadoConciliacion = 'CANCELADA POR EL COMPRADOR';
+  } else if (estadoFsc === 'returned') {
+    estadoConciliacion = 'DEVOLUCION CON REEMBOLSO';
   } else if (modo === 'HISTORICO') {
     estadoConciliacion = 'PENDIENTE_HISTORICO';
   } else {
@@ -844,37 +845,37 @@ function fsc_buildRow_(order, item, modo) {
   }
 
   return [
-    new Date(),                                           // A fecha_ingesta
-    'FS',                                                 // B canal
-    orderId,                                              // C fsc_order_id
-    String(order.OrderNumber    || ''),                   // D fsc_order_number
-    orderItemId,                                          // E fsc_order_item_id
-    String(item.PackageId       || ''),                   // F fsc_package_id
-    orderId + '-' + orderItemId,                          // G id_venta_canal
-    String(item.CreatedAt       || ''),                   // H fecha_venta
-    String(item.ShopSku         || ''),                   // I sku_canal
-    sku,                                                  // J sku_maestro
-    mpn,                                                  // K mpn
-    1,                                                    // L cantidad
-    parseFloat(item.ItemPrice   || 0),                    // M precio_unitario
-    paidPrice,                                            // N monto_total
-    cargoVenta,                                           // O cargo_venta
-    shippingAmt,                                          // P cargo_envio
-    shippingType,                                         // Q shipping_type
-    montoNeto,                                            // R monto_neto
+    new Date(),                                            // A fecha_ingesta
+    'FS',                                                  // B canal
+    orderId,                                               // C fsc_order_id
+    String(order.OrderNumber    || ''),                    // D fsc_order_number
+    orderItemId,                                           // E fsc_order_item_id
+    String(item.PackageId       || ''),                    // F fsc_package_id
+    orderId + '-' + orderItemId,                           // G id_venta_canal
+    String(item.CreatedAt       || ''),                    // H fecha_venta
+    String(item.ShopSku         || ''),                    // I sku_canal
+    sku,                                                   // J sku_maestro
+    mpn,                                                   // K mpn
+    1,                                                     // L cantidad
+    parseFloat(item.ItemPrice   || 0),                     // M precio_unitario
+    paidPrice,                                             // N monto_total
+    cargoVenta,                                            // O cargo_venta
+    shippingAmt,                                           // P cargo_envio
+    shippingType,                                          // Q shipping_type
+    montoNeto,                                             // R monto_neto
     String((order.CustomerFirstName || '') + ' ' +
-           (order.CustomerLastName  || '')).trim(),       // S cliente_nombre
-    fsc_safeAddr_(order, 'State'),                        // T region
-    fsc_safeAddr_(order, 'City'),                         // U comuna
-    fsc_safeAddr_(order, 'Address1'),                     // V direccion_resumen
-    String(item.Status          || ''),                   // W estado_fsc
-    estadoConciliacion,                                   // X estado_conciliacion
-    '',                                                   // Y fecha_conciliacion
-    '',                                                   // Z mensaje_conciliacion
-    orderId + '-' + orderItemId,                          // AA clave_unica
-    false,                                                // AB existe_en_ventas
-    JSON.stringify({ order_id: orderId, item: item }),    // AC json_raw
-    isFBF ? 'FBF - no consume stock' : ''                // AD observaciones
+           (order.CustomerLastName  || '')).trim(),        // S cliente_nombre
+    fsc_safeAddr_(order, 'State'),                         // T region
+    fsc_safeAddr_(order, 'City'),                          // U comuna
+    fsc_safeAddr_(order, 'Address1'),                      // V direccion_resumen
+    String(item.Status          || ''),                    // W estado_fsc
+    estadoConciliacion,                                    // X estado_conciliacion
+    '',                                                    // Y fecha_conciliacion
+    '',                                                    // Z mensaje_conciliacion
+    orderId + '-' + orderItemId,                           // AA clave_unica
+    false,                                                 // AB existe_en_ventas
+    JSON.stringify({ order_id: orderId, item: item }),     // AC json_raw
+    isFBF ? 'FBF - no consume stock' : ''                 // AD observaciones
   ];
 }
 
@@ -883,9 +884,7 @@ function fsc_buildRow_(order, item, modo) {
 function fsc_safeAddr_(order, field) {
   try {
     return String(order.AddressShipping[field] || '');
-  } catch(e) {
-    return '';
-  }
+  } catch(e) { return ''; }
 }
 
 
@@ -919,26 +918,21 @@ function fsc_crearHojaVentasFSC_() {
   sh.getRange(1, 1, 1, FSC_HEADERS.length).setValues([FSC_HEADERS]);
   sh.setFrozenRows(1);
 
-  // Formato fecha cols A(1) y H(8)
-  sh.getRange(2, 1, sh.getMaxRows() - 1, 1)
-    .setNumberFormat('dd/mm/yyyy hh:mm:ss');
-  sh.getRange(2, 8, sh.getMaxRows() - 1, 1)
-    .setNumberFormat('dd/mm/yyyy hh:mm:ss');
-
-  // Formato número cols M(13),N(14),O(15),P(16),R(18)
+  sh.getRange(2, 1, sh.getMaxRows() - 1, 1).setNumberFormat('dd/mm/yyyy hh:mm:ss');
+  sh.getRange(2, 8, sh.getMaxRows() - 1, 1).setNumberFormat('dd/mm/yyyy hh:mm:ss');
   [13, 14, 15, 16, 18].forEach(function(c) {
-    sh.getRange(2, c, sh.getMaxRows() - 1, 1)
-      .setNumberFormat('#,##0');
+    sh.getRange(2, c, sh.getMaxRows() - 1, 1).setNumberFormat('#,##0');
   });
 
   return sh;
 }
+
 
 // ── Normaliza fecha ISO para API FSC ────────────────────────────
 // Entrada:  2024-01-01T00:00:00.000-03:00
 // Salida:   2024-01-01T00:00:00-0300
 function fsc_normalizeDate_(isoStr) {
   return String(isoStr)
-    .replace(/\.\d+/, '')                          // elimina milisegundos
-    .replace(/([+-]\d{2}):(\d{2})$/, '$1$2');      // -03:00 → -0300
+    .replace(/\.\d+/, '')
+    .replace(/([+-]\d{2}):(\d{2})$/, '$1$2');
 }
