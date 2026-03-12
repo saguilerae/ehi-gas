@@ -578,8 +578,9 @@ const FSC_HEADERS = [
 
 
 // ── Función pública menú: Ingesta Histórica ─────────────────────
-// Usa ventanas de 30 días desde FALABELLA_HISTORICAL_FROM hasta hoy.
-// Única estrategia válida para FSC: UpdatedAfter con rango largo retorna 0.
+// Ventanas de 30 días desde FALABELLA_HISTORICAL_FROM hasta hoy.
+// Flush condicional: acumula en memoria y escribe en hoja solo al
+// final o cuando elapsed > 5 min (antes del timeout de 6 min GAS).
 function fsc_ingestaHistorica() {
   const props          = PropertiesService.getScriptProperties();
   const historicalFrom = String(props.getProperty('FALABELLA_HISTORICAL_FROM') || '').trim();
@@ -600,11 +601,25 @@ function fsc_ingestaHistorica() {
   let desde          = new Date(historicalFrom);
   const hasta        = new Date();
   const VENTANA_DIAS = 30;
-  let totalOrders    = 0;
-  let totalInserted  = 0;
-  let ventana        = 0;
+  const MAX_MS       = 5 * 60 * 1000; // 5 min — margen antes del timeout GAS (6 min)
+
+  let totalOrders   = 0;
+  let totalInserted = 0;
+  let ventana       = 0;
+  let allRows       = [];             // buffer en memoria
+  const startTime   = Date.now();
 
   SpreadsheetApp.getActive().toast('Ingesta histórica FSC iniciada...', 'EHI', 5);
+
+  // ── Helper flush ─────────────────────────────────────────────
+  function flushRows_() {
+    if (!allRows.length) return;
+    const startRow = Math.max(sh.getLastRow() + 1, 2);
+    sh.getRange(startRow, 1, allRows.length, FSC_HEADERS.length).setValues(allRows);
+    totalInserted  += allRows.length;
+    allRows.length  = 0;  // limpia sin reasignar
+    Logger.log(FSC_LOG_HIST + ' Flush: totalInserted hasta ahora=' + totalInserted);
+  }
 
   while (desde < hasta) {
     const fin     = new Date(desde);
@@ -617,6 +632,12 @@ function fsc_ingestaHistorica() {
     ventana++;
     Logger.log(FSC_LOG_HIST + ' Ventana ' + ventana + ': ' + updatedAfter + ' → ' + updatedBefore);
 
+    // ── Toast de progreso ────────────────────────────────────────
+    SpreadsheetApp.getActive().toast(
+      'Ventana ' + ventana + ' | Órdenes acumuladas: ' + totalOrders + ' | Filas buffer: ' + allRows.length,
+      'FSC Histórico ⏳', 8
+    );
+
     let offset         = 0;
     let shouldContinue = true;
 
@@ -628,7 +649,6 @@ function fsc_ingestaHistorica() {
       const orderIds = orders.map(function(o) { return String(o.OrderId); });
       const itemsMap = fsc_fetchOrderItems_(orderIds, cfg);
 
-      const rowsToAppend = [];
       for (var i = 0; i < orders.length; i++) {
         const order = orders[i];
         const oid   = String(order.OrderId);
@@ -636,15 +656,9 @@ function fsc_ingestaHistorica() {
         for (var j = 0; j < items.length; j++) {
           const clave = oid + '-' + String(items[j].OrderItemId);
           if (existingKeys.has(clave)) continue;
-          rowsToAppend.push(fsc_buildRow_(order, items[j], 'HISTORICO'));
+          allRows.push(fsc_buildRow_(order, items[j], 'HISTORICO'));
           existingKeys.add(clave);
         }
-      }
-
-      if (rowsToAppend.length) {
-        const startRow = Math.max(sh.getLastRow() + 1, 2);
-        sh.getRange(startRow, 1, rowsToAppend.length, FSC_HEADERS.length).setValues(rowsToAppend);
-        totalInserted += rowsToAppend.length;
       }
 
       if (orders.length < FSC_PAGE_LIMIT) {
@@ -655,9 +669,18 @@ function fsc_ingestaHistorica() {
       }
     }
 
+    // ── Flush condicional al terminar cada ventana ────────────
+    if (Date.now() - startTime > MAX_MS) {
+      Logger.log(FSC_LOG_HIST + ' Timeout inminente — flush forzado en ventana ' + ventana);
+      flushRows_();
+    }
+
     desde = fin;
     Utilities.sleep(FSC_PACING_MS);
   }
+
+  // ── Flush final con lo que quedó en buffer ────────────────────
+  flushRows_();
 
   const resumen = { ventanas: ventana, fetchedOrders: totalOrders, insertedRows: totalInserted };
   Logger.log(FSC_LOG_HIST + ' Resumen: ' + JSON.stringify(resumen));
@@ -670,70 +693,108 @@ function fsc_ingestaHistorica() {
 
 
 // ── Función pública menú: Ingesta Incremental ───────────────────
+// Ventanas de 7 días desde FALABELLA_LAST_SYNC hasta hoy.
+// Flush condicional: misma estrategia que histórico.
 function fsc_ingestaIncremental() {
   const props    = PropertiesService.getScriptProperties();
   const lastSync = String(props.getProperty('FALABELLA_LAST_SYNC') || '').trim();
 
   if (!lastSync) throw new Error('Falta FALABELLA_LAST_SYNC en Script Properties.');
 
-  const cfg          = getFalabellaConfig_();
-  const searchFrom   = fsc_normalizeDate_(lastSync);
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sh   = ss.getSheetByName(FSC_SHEET_VENTAS);
+  const cfg = getFalabellaConfig_();
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  let sh    = ss.getSheetByName(FSC_SHEET_VENTAS);
   if (!sh) sh = fsc_crearHojaVentasFSC_();
 
   const headerMap    = fsc_getHeaderMap_(sh);
   const existingKeys = fsc_getExistingKeys_(sh, headerMap['clave_unica']);
 
-  let offset         = 0;
-  let totalOrders    = 0;
-  let totalInserted  = 0;
-  let shouldContinue = true;
+  let desde          = new Date(lastSync);
+  const hasta        = new Date();
+  const VENTANA_DIAS = 7;
+  const MAX_MS       = 5 * 60 * 1000;
+
+  let totalOrders   = 0;
+  let totalInserted = 0;
+  let ventana       = 0;
+  let allRows       = [];
+  const startTime   = Date.now();
 
   SpreadsheetApp.getActive().toast('Ingesta incremental FSC iniciada...', 'EHI', 5);
 
-  while (shouldContinue) {
-    const orders = fsc_fetchOrdersVentana_(searchFrom, null, offset, cfg);
-    if (!orders.length) break;
-    totalOrders += orders.length;
+  function flushRows_() {
+    if (!allRows.length) return;
+    const startRow = Math.max(sh.getLastRow() + 1, 2);
+    sh.getRange(startRow, 1, allRows.length, FSC_HEADERS.length).setValues(allRows);
+    totalInserted  += allRows.length;
+    allRows.length  = 0;
+    Logger.log(FSC_LOG_INC + ' Flush: totalInserted hasta ahora=' + totalInserted);
+  }
 
-    const orderIds = orders.map(function(o) { return String(o.OrderId); });
-    const itemsMap = fsc_fetchOrderItems_(orderIds, cfg);
+  while (desde < hasta) {
+    const fin     = new Date(desde);
+    fin.setDate(fin.getDate() + VENTANA_DIAS);
+    const finReal = fin > hasta ? hasta : fin;
 
-    const rowsToAppend = [];
-    for (var i = 0; i < orders.length; i++) {
-      const order = orders[i];
-      const oid   = String(order.OrderId);
-      const items = itemsMap[oid] || [];
-      for (var j = 0; j < items.length; j++) {
-        const clave = oid + '-' + String(items[j].OrderItemId);
-        if (existingKeys.has(clave)) continue;
-        rowsToAppend.push(fsc_buildRow_(order, items[j], 'INCREMENTAL'));
-        existingKeys.add(clave);
+    const updatedAfter  = fsc_normalizeDate_(desde.toISOString());
+    const updatedBefore = fsc_normalizeDate_(finReal.toISOString());
+
+    ventana++;
+    Logger.log(FSC_LOG_INC + ' Ventana ' + ventana + ': ' + updatedAfter + ' → ' + updatedBefore);
+    SpreadsheetApp.getActive().toast(
+      'Ventana ' + ventana + ' | Órdenes acumuladas: ' + totalOrders + ' | Filas buffer: ' + allRows.length,
+      'FSC Incremental ⏳', 8
+    );
+
+    let offset         = 0;
+    let shouldContinue = true;
+
+    while (shouldContinue) {
+      const orders = fsc_fetchOrdersVentana_(updatedAfter, updatedBefore, offset, cfg);
+      if (!orders.length) break;
+      totalOrders += orders.length;
+
+      const orderIds = orders.map(function(o) { return String(o.OrderId); });
+      const itemsMap = fsc_fetchOrderItems_(orderIds, cfg);
+
+      for (var i = 0; i < orders.length; i++) {
+        const order = orders[i];
+        const oid   = String(order.OrderId);
+        const items = itemsMap[oid] || [];
+        for (var j = 0; j < items.length; j++) {
+          const clave = oid + '-' + String(items[j].OrderItemId);
+          if (existingKeys.has(clave)) continue;
+          allRows.push(fsc_buildRow_(order, items[j], 'INCREMENTAL'));
+          existingKeys.add(clave);
+        }
+      }
+
+      if (orders.length < FSC_PAGE_LIMIT) {
+        shouldContinue = false;
+      } else {
+        offset += FSC_PAGE_LIMIT;
+        Utilities.sleep(FSC_PACING_MS);
       }
     }
 
-    if (rowsToAppend.length) {
-      const startRow = Math.max(sh.getLastRow() + 1, 2);
-      sh.getRange(startRow, 1, rowsToAppend.length, FSC_HEADERS.length).setValues(rowsToAppend);
-      totalInserted += rowsToAppend.length;
+    if (Date.now() - startTime > MAX_MS) {
+      Logger.log(FSC_LOG_INC + ' Timeout inminente — flush forzado en ventana ' + ventana);
+      flushRows_();
     }
 
-    if (orders.length < FSC_PAGE_LIMIT) {
-      shouldContinue = false;
-    } else {
-      offset += FSC_PAGE_LIMIT;
-      Utilities.sleep(FSC_PACING_MS);
-    }
+    desde = fin;
+    Utilities.sleep(FSC_PACING_MS);
   }
 
-  props.setProperty('FALABELLA_LAST_SYNC', new Date().toISOString());
+  flushRows_();
 
-  const resumen = { searchFrom: searchFrom, fetchedOrders: totalOrders, insertedRows: totalInserted };
+  // Actualizar LAST_SYNC al finalizar exitosamente
+  props.setProperty('FALABELLA_LAST_SYNC', hasta.toISOString());
+
+  const resumen = { ventanas: ventana, fetchedOrders: totalOrders, insertedRows: totalInserted };
   Logger.log(FSC_LOG_INC + ' Resumen: ' + JSON.stringify(resumen));
   SpreadsheetApp.getActive().toast(
-    'FSC incremental: órdenes=' + totalOrders + ' | filas nuevas=' + totalInserted,
+    'FSC incremental: ventanas=' + ventana + ' | órdenes=' + totalOrders + ' | filas=' + totalInserted,
     'EHI', 7
   );
   return resumen;
