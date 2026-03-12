@@ -634,6 +634,9 @@ function fsc_ingestarVentasFSC_(opts) {
   let shouldContinue      = true;
 
   SpreadsheetApp.getActive().toast('Ingesta FSC iniciada (' + modo + ')', 'EHI', 5);
+  
+  // Normalizar formato fecha para API FSC
+  searchFrom = fsc_normalizeDate_(searchFrom);
 
   while (shouldContinue) {
     // 1. Traer página de órdenes
@@ -929,4 +932,13 @@ function fsc_crearHojaVentasFSC_() {
   });
 
   return sh;
+}
+
+// ── Normaliza fecha ISO para API FSC ────────────────────────────
+// Entrada:  2024-01-01T00:00:00.000-03:00
+// Salida:   2024-01-01T00:00:00-0300
+function fsc_normalizeDate_(isoStr) {
+  return String(isoStr)
+    .replace(/\.\d+/, '')                          // elimina milisegundos
+    .replace(/([+-]\d{2}):(\d{2})$/, '$1$2');      // -03:00 → -0300
 }
