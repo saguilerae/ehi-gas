@@ -705,7 +705,7 @@ function fsc_fetchOrders_(searchFrom, modo, offset) {
     const params = {
       Action:       'GetOrders',
       Format:       'JSON',
-      Version:      '2.0',
+      Version:      '1.0',
       UserID:       cfg.userId,
       Timestamp:    getCurrentTimestamp(),
       Limit:        String(FSC_PAGE_LIMIT),
@@ -747,6 +747,7 @@ function fsc_fetchOrders_(searchFrom, modo, offset) {
 
 
 // ── Fetch items para múltiples órdenes en chunks ────────────────
+// ── Fetch items para múltiples órdenes en chunks ────────────────
 function fsc_fetchMultipleOrderItems_(orderIdList, cfg) {
   cfg = cfg || getFalabellaConfig_();
   const result = {};
@@ -754,16 +755,32 @@ function fsc_fetchMultipleOrderItems_(orderIdList, cfg) {
   for (var i = 0; i < orderIdList.length; i += FSC_ITEMS_CHUNK) {
     const chunk = orderIdList.slice(i, i + FSC_ITEMS_CHUNK);
     try {
+      // Construir params SIN OrderIdList — no debe entrar en la firma
       const params = {
-        Action:      'GetMultipleOrderItems',
-        Format:      'JSON',
-        Version:     '1.0',
-        UserID:      cfg.userId,
-        Timestamp:   getCurrentTimestamp(),
-        OrderIdList: '[' + chunk.join(',') + ']'
+        Action:    'GetMultipleOrderItems',
+        Format:    'JSON',
+        Version:   '1.0',
+        UserID:    cfg.userId,
+        Timestamp: getCurrentTimestamp()
       };
 
-      const raw  = getSellercenterApiResponse(params, cfg.apiKey, '', 'get');
+      // Construir firma manualmente (OrderIdList se agrega DESPUÉS de la firma)
+      const sortedParams = Object.keys(params).sort().reduce(function(acc, key) {
+        acc[key] = params[key];
+        return acc;
+      }, {});
+      const qs        = toQueryString(sortedParams);
+      const signature = hmacDigest(qs, cfg.apiKey, HASH_ALGORITHM);
+      const finalUrl  = ScApiHost + '?' + qs
+                      + '&Signature='   + encodeURIComponent(signature)
+                      + '&OrderIdList=' + encodeURIComponent('[' + chunk.join(',') + ']');
+
+      const response = UrlFetchApp.fetch(finalUrl, {
+        method:             'get',
+        muteHttpExceptions: true,
+        headers:            { 'User-Agent': UserAgent }
+      });
+      const raw  = response.getContentText();
       const resp = JSON.parse(raw);
 
       if (resp.ErrorResponse) {
@@ -798,7 +815,6 @@ function fsc_fetchMultipleOrderItems_(orderIdList, cfg) {
   }
   return result;
 }
-
 
 // ── Construir una fila de 30 columnas ──────────────────────────
 function fsc_buildRow_(order, item, modo) {
