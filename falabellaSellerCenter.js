@@ -997,3 +997,172 @@ function fsc_normalizeDate_(isoStr) {
     .replace(/\.\d+/, '')
     .replace(/([+-]\d{2}):(\d{2})$/, '$1$2');
 }
+
+// ===================================================================
+// VENTAS FSC — Etapa 2: Conciliación
+// Cruza hoja "Ventas FSC" contra hoja "Ventas" (fuente de verdad).
+// ===================================================================
+
+function fsc_conciliar() {
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const shFsc    = ss.getSheetByName(FSC_SHEET_VENTAS);
+  const shVentas = ss.getSheetByName('Ventas');
+
+  if (!shFsc)    throw new Error('No existe hoja "Ventas FSC".');
+  if (!shVentas) throw new Error('No existe hoja "Ventas".');
+
+  SpreadsheetApp.getActive().toast('Conciliación FSC iniciada...', 'EHI', 5);
+
+  // ── 1. Construir mapas hoja Ventas ────────────────────────────
+  const hVentas     = shVentas.getDataRange().getValues();
+  const hVentasHead = hVentas[0].map(function(h) {
+    return String(h).replace(/\n/g, '').trim();
+  });
+
+  const colNumVenta   = hVentasHead.indexOf('# Venta');
+  const colSku        = hVentasHead.indexOf('SKU');
+  const colPrecioV    = hVentasHead.indexOf('PrecioVenta');
+  const colCargosV    = hVentasHead.indexOf('Cargos porVenta');
+  const colCargoEnvio = hVentasHead.indexOf('Cargo porEnvío');
+  const colRecaudado  = hVentasHead.indexOf('Recaudado');
+
+  if ([colNumVenta, colSku, colPrecioV, colCargosV, colCargoEnvio, colRecaudado].includes(-1)) {
+    throw new Error('Faltan columnas requeridas en hoja Ventas. Verifica: # Venta, SKU, PrecioVenta, Cargos porVenta, Cargo porEnvío, Recaudado.');
+  }
+
+  const mapaVentasSimple    = {};  // # Venta → datos
+  const mapaVentasCompuesto = {};  // # Venta|SKU → datos
+
+  for (var r = 1; r < hVentas.length; r++) {
+    const numVenta = String(hVentas[r][colNumVenta]).trim();
+    if (!numVenta) continue;
+
+    const precioVenta = fsc_parseNumber_(hVentas[r][colPrecioV]);
+    if (precioVenta < 0) continue;  // notas de crédito — se omiten
+
+    const sku   = String(hVentas[r][colSku]).trim();
+    const datos = {
+      precioVenta: precioVenta,
+      cargosVenta: fsc_parseNumber_(hVentas[r][colCargosV]),
+      cargoEnvio:  fsc_parseNumber_(hVentas[r][colCargoEnvio]),
+      recaudado:   fsc_parseNumber_(hVentas[r][colRecaudado])
+    };
+
+    mapaVentasSimple[numVenta]               = datos;
+    mapaVentasCompuesto[numVenta + '|' + sku] = datos;
+  }
+
+  // ── 2. Leer hoja Ventas FSC ───────────────────────────────────
+  const hFsc   = shFsc.getDataRange().getValues();
+  const mapFsc = fsc_getHeaderMap_(shFsc);
+
+  const COL_ORDER_NUMBER = mapFsc['fsc_order_number'];
+  const COL_SKU_MAESTRO  = mapFsc['sku_maestro'];
+  const COL_MONTO_TOTAL  = mapFsc['monto_total'];
+  const COL_CARGO_VENTA  = mapFsc['cargo_venta'];
+  const COL_CARGO_ENVIO  = mapFsc['cargo_envio'];
+  const COL_MONTO_NETO   = mapFsc['monto_neto'];
+  const COL_ESTADO_CONC  = mapFsc['estado_conciliacion'];
+  const COL_FECHA_CONC   = mapFsc['fecha_conciliacion'];
+  const COL_MENSAJE_CONC = mapFsc['mensaje_conciliacion'];
+
+  const ESTADOS_OMITIR = new Set([
+    'CANCELADA POR EL COMPRADOR', 'CONCILIADA',
+    'DIFERENCIA', 'DIFERENCIA_CONOCIDA', 'NO ENCONTRADA EN VENTAS'
+  ]);
+
+  const TOLERANCIA = 1;
+  let procesadas        = 0;
+  let conciliadas       = 0;
+  let diferencias       = 0;
+  let diferenciasConocidas = 0;
+  let noEncontradas     = 0;
+  const ahora           = new Date();
+
+  // ── 3. Procesar cada fila ─────────────────────────────────────
+  for (var i = 1; i < hFsc.length; i++) {
+    const estadoConc = String(hFsc[i][COL_ESTADO_CONC]).trim();
+    if (ESTADOS_OMITIR.has(estadoConc)) continue;
+
+    procesadas++;
+    const orderNumber = String(hFsc[i][COL_ORDER_NUMBER]).trim();
+    const skuMaestro  = String(hFsc[i][COL_SKU_MAESTRO]).trim();
+
+    // ── Búsqueda 2 niveles ──────────────────────────────────
+    // Nivel 1: # Venta + SKU (orden con múltiples ítems distintos)
+    // Nivel 2: # Venta simple (orden con un solo ítem — fallback)
+    const claveComp = orderNumber + '|' + skuMaestro;
+    const ventaRow  = mapaVentasCompuesto[claveComp] || mapaVentasSimple[orderNumber];
+
+    // ── No encontrada ───────────────────────────────────────
+    if (!ventaRow) {
+      shFsc.getRange(i + 1, COL_ESTADO_CONC  + 1).setValue('NO ENCONTRADA EN VENTAS');
+      shFsc.getRange(i + 1, COL_FECHA_CONC   + 1).setValue(ahora);
+      shFsc.getRange(i + 1, COL_MENSAJE_CONC + 1).setValue('# Venta ' + orderNumber + ' no existe en hoja Ventas');
+      noEncontradas++;
+      continue;
+    }
+
+    // ── Comparar 4 campos con tolerancia ±$1 ───────────────
+    const montoTotal = fsc_parseNumber_(hFsc[i][COL_MONTO_TOTAL]);
+    const cargoVenta = fsc_parseNumber_(hFsc[i][COL_CARGO_VENTA]);
+    const cargoEnvio = fsc_parseNumber_(hFsc[i][COL_CARGO_ENVIO]);
+    const montoNeto  = fsc_parseNumber_(hFsc[i][COL_MONTO_NETO]);
+
+    const diffs = [];
+    if (Math.abs(montoTotal - ventaRow.precioVenta) > TOLERANCIA)
+      diffs.push('monto_total: '  + montoTotal + ' vs ' + ventaRow.precioVenta);
+    if (Math.abs(cargoVenta - ventaRow.cargosVenta) > TOLERANCIA)
+      diffs.push('cargo_venta: '  + cargoVenta + ' vs ' + ventaRow.cargosVenta);
+    if (Math.abs(cargoEnvio - ventaRow.cargoEnvio)  > TOLERANCIA)
+      diffs.push('cargo_envio: '  + cargoEnvio + ' vs ' + ventaRow.cargoEnvio);
+    if (Math.abs(montoNeto  - ventaRow.recaudado)   > TOLERANCIA)
+      diffs.push('monto_neto: '   + montoNeto  + ' vs ' + ventaRow.recaudado);
+
+    let nuevoEstado, mensaje;
+
+    if (!diffs.length) {
+      nuevoEstado = 'CONCILIADA';
+      mensaje     = 'OK';
+      conciliadas++;
+    } else {
+      // Si la única diferencia es monto_neto → cofinanciamiento logístico FSC
+      const soloNeto = diffs.every(function(d) { return d.indexOf('monto_neto') === 0; });
+      if (soloNeto) {
+        nuevoEstado = 'DIFERENCIA_CONOCIDA';
+        mensaje     = 'Posible cofinanciamiento logístico FSC (no disponible en API). ' + diffs.join(' | ');
+        diferenciasConocidas++;
+      } else {
+        nuevoEstado = 'DIFERENCIA';
+        mensaje     = diffs.join(' | ');
+        diferencias++;
+      }
+    }
+
+    shFsc.getRange(i + 1, COL_ESTADO_CONC  + 1).setValue(nuevoEstado);
+    shFsc.getRange(i + 1, COL_FECHA_CONC   + 1).setValue(ahora);
+    shFsc.getRange(i + 1, COL_MENSAJE_CONC + 1).setValue(mensaje);
+  }
+
+  const resumen = {
+    procesadas: procesadas, conciliadas: conciliadas,
+    diferencias: diferencias, diferenciasConocidas: diferenciasConocidas,
+    noEncontradas: noEncontradas
+  };
+  Logger.log('[FSC-CONC] Resumen: ' + JSON.stringify(resumen));
+  SpreadsheetApp.getActive().toast(
+    'FSC conciliación: ' + procesadas + ' procesadas | ' +
+    conciliadas + ' ok | ' + diferencias + ' diff | ' +
+    diferenciasConocidas + ' diff_conocida | ' + noEncontradas + ' no encontradas',
+    'EHI', 10
+  );
+  return resumen;
+}
+
+
+// ── Helper: parsea número en formato chileno o número directo ───
+function fsc_parseNumber_(val) {
+  if (val === null || val === undefined || val === '') return 0;
+  if (typeof val === 'number') return Math.round(val);
+  return parseInt(String(val).replace(/\./g, '').replace(/,/g, ''), 10) || 0;
+}
