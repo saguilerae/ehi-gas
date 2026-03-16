@@ -565,7 +565,7 @@ const FSC_HEADERS = [
   'fsc_order_item_id','fsc_package_id','id_venta_canal','fecha_venta',
   'sku_canal','sku_maestro','mpn','cantidad',
   'precio_unitario','monto_total','cargo_venta','cargo_envio',
-  'shipping_type','monto_neto','cliente_nombre','region',
+  'monto_neto','shipping_type','cliente_nombre','region',
   'comuna','direccion_resumen','estado_fsc','estado_conciliacion',
   'fecha_conciliacion','mensaje_conciliacion','clave_unica',
   'existe_en_ventas','json_raw','observaciones'
@@ -922,8 +922,8 @@ function fsc_buildRow_(order, item, modo) {
     paidPrice,                                             // N monto_total
     cargoVenta,                                            // O cargo_venta
     shippingAmt,                                           // P cargo_envio
-    shippingType,                                          // Q shipping_type
-    montoNeto,                                             // R monto_neto
+    montoNeto,                                             // Q monto_neto
+    shippingType,                                          // R shipping_type
     String((order.CustomerFirstName || '') + ' ' +
            (order.CustomerLastName  || '')).trim(),        // S cliente_nombre
     fsc_safeAddr_(order, 'State'),                         // T region
@@ -981,7 +981,7 @@ function fsc_crearHojaVentasFSC_() {
 
   sh.getRange(2, 1, sh.getMaxRows() - 1, 1).setNumberFormat('dd/mm/yyyy hh:mm:ss');
   sh.getRange(2, 8, sh.getMaxRows() - 1, 1).setNumberFormat('dd/mm/yyyy hh:mm:ss');
-  [13, 14, 15, 16, 18].forEach(function(c) {
+  [13, 14, 15, 16, 17].forEach(function(c) {
     sh.getRange(2, c, sh.getMaxRows() - 1, 1).setNumberFormat('#,##0');
   });
 
