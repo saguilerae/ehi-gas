@@ -1483,3 +1483,577 @@ function paris_fetchAllStockMap_(limit) {
   return out;
 }
 
+// ===================================================================
+// VENTAS PM — Ingesta de Órdenes Paris Marketplace
+// Etapa 1: Ingesta (Histórica e Incremental)
+// ===================================================================
+
+// Constantes del módulo
+const PM_SHEET_VENTAS   = 'Ventas PM';
+const PM_COMISION_RATE  = 0.20;
+const PM_PAGE_LIMIT     = 100;
+const PM_PACING_MS      = 300;
+const PM_LOG_HIST       = '[PM-HIST]';
+const PM_LOG_INC        = '[PM-INC]';
+const PM_MAX_MS         = 5 * 60 * 1000; // 5 min — flush condicional
+
+// Headers exactos de la hoja — 29 columnas
+const PM_HEADERS = [
+  'fecha_ingesta','canal','pm_order_id','pm_order_number',
+  'pm_suborder_number','pm_suborder_id','id_venta_canal','fecha_venta',
+  'sku_canal','sku_maestro','mpn','cantidad',
+  'precio_unitario','monto_total','cargo_venta','cargo_envio',
+  'monto_neto','fulfillment_type','cliente_nombre','region',
+  'comuna','direccion_resumen','estado_pm','estado_conciliacion',
+  'fecha_conciliacion','mensaje_conciliacion','clave_unica',
+  'existe_en_ventas','json_raw'
+];
+
+// Estados de conciliación válidos (referencia)
+// PENDIENTE | PENDIENTE_HISTORICO | CANCELADA POR EL COMPRADOR |
+// DEVOLUCION CON REEMBOLSO | CONCILIADA | DIFERENCIA |
+// DIFERENCIA_CONOCIDA | NO ENCONTRADA EN VENTAS
+
+
+// ── Función pública menú: Ingesta Histórica ─────────────────────
+// Ventanas de 30 días desde PARIS_HISTORICAL_FROM hasta hoy.
+function pm_ingestaHistorica() {
+  const props          = PropertiesService.getScriptProperties();
+  const historicalFrom = String(props.getProperty('PARIS_HISTORICAL_FROM') || '').trim();
+
+  if (!historicalFrom) {
+    SpreadsheetApp.getActive().toast('Falta PARIS_HISTORICAL_FROM en Script Properties.', 'PM', 5);
+    return;
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh   = ss.getSheetByName(PM_SHEET_VENTAS);
+  if (!sh) sh = pm_crearHojaVentasPM_();
+
+  const existingKeys = pm_getExistingKeys_(sh);
+  const startTime    = Date.now();
+
+  let desde          = new Date(historicalFrom);
+  const hasta        = new Date();
+  const VENTANA_DIAS = 30;
+  let totalOrders    = 0;
+  let totalInserted  = 0;
+  let ventana        = 0;
+  let allRows        = [];
+
+  SpreadsheetApp.getActive().toast('Ingesta histórica PM iniciada...', 'EHI', 5);
+
+  function flushRows_() {
+    if (!allRows.length) return;
+    const startRow = Math.max(sh.getLastRow() + 1, 2);
+    sh.getRange(startRow, 1, allRows.length, PM_HEADERS.length).setValues(allRows);
+    totalInserted  += allRows.length;
+    allRows.length  = 0;
+    Logger.log(PM_LOG_HIST + ' Flush: totalInserted=' + totalInserted);
+  }
+
+  while (desde < hasta) {
+    const fin     = new Date(desde);
+    fin.setDate(fin.getDate() + VENTANA_DIAS);
+    const finReal = fin > hasta ? hasta : fin;
+
+    const gteCreatedAt = pm_formatDate_(desde);
+    const lteCreatedAt = pm_formatDate_(finReal);
+
+    ventana++;
+    Logger.log(PM_LOG_HIST + ' Ventana ' + ventana + ': ' + gteCreatedAt + ' → ' + lteCreatedAt);
+    SpreadsheetApp.getActive().toast(
+      'Ventana ' + ventana + ' | Órdenes acumuladas: ' + totalOrders + ' | Buffer: ' + allRows.length,
+      'PM Histórico ⏳', 8
+    );
+
+    let offset         = 0;
+    let shouldContinue = true;
+
+    while (shouldContinue) {
+      const data = pm_fetchOrders_(gteCreatedAt, lteCreatedAt, offset);
+      const orders = (data && data.data) ? data.data : [];
+      if (!orders.length) break;
+
+      totalOrders += orders.length;
+
+      for (var i = 0; i < orders.length; i++) {
+        const rows = pm_buildRows_(orders[i], 'HISTORICO', existingKeys);
+        for (var j = 0; j < rows.length; j++) {
+          allRows.push(rows[j]);
+        }
+      }
+
+      if (orders.length < PM_PAGE_LIMIT) {
+        shouldContinue = false;
+      } else {
+        offset += PM_PAGE_LIMIT;
+        Utilities.sleep(PM_PACING_MS);
+      }
+    }
+
+    // Flush condicional si se acerca el timeout
+    if (Date.now() - startTime > PM_MAX_MS) {
+      Logger.log(PM_LOG_HIST + ' Timeout inminente — flush forzado en ventana ' + ventana);
+      flushRows_();
+    }
+
+    desde = fin;
+    Utilities.sleep(PM_PACING_MS);
+  }
+
+  flushRows_(); // flush final
+
+  const resumen = { ventanas: ventana, fetchedOrders: totalOrders, insertedRows: totalInserted };
+  Logger.log(PM_LOG_HIST + ' Resumen: ' + JSON.stringify(resumen));
+  SpreadsheetApp.getActive().toast(
+    'PM histórico: ventanas=' + ventana + ' | órdenes=' + totalOrders + ' | filas=' + totalInserted,
+    'EHI', 10
+  );
+  return resumen;
+}
+
+
+// ── Función pública menú: Ingesta Incremental ───────────────────
+// Ventanas de 7 días desde PARIS_LAST_SYNC hasta hoy.
+function pm_ingestaIncremental() {
+  const props    = PropertiesService.getScriptProperties();
+  const lastSync = String(props.getProperty('PARIS_LAST_SYNC') || '').trim();
+
+  if (!lastSync) throw new Error('Falta PARIS_LAST_SYNC en Script Properties.');
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh   = ss.getSheetByName(PM_SHEET_VENTAS);
+  if (!sh) sh = pm_crearHojaVentasPM_();
+
+  const existingKeys = pm_getExistingKeys_(sh);
+  const startTime    = Date.now();
+
+  let desde          = new Date(lastSync);
+  const hasta        = new Date();
+  const VENTANA_DIAS = 7;
+  let totalOrders    = 0;
+  let totalInserted  = 0;
+  let ventana        = 0;
+  let allRows        = [];
+
+  SpreadsheetApp.getActive().toast('Ingesta incremental PM iniciada...', 'EHI', 5);
+
+  function flushRows_() {
+    if (!allRows.length) return;
+    const startRow = Math.max(sh.getLastRow() + 1, 2);
+    sh.getRange(startRow, 1, allRows.length, PM_HEADERS.length).setValues(allRows);
+    totalInserted  += allRows.length;
+    allRows.length  = 0;
+    Logger.log(PM_LOG_INC + ' Flush: totalInserted=' + totalInserted);
+  }
+
+  while (desde < hasta) {
+    const fin     = new Date(desde);
+    fin.setDate(fin.getDate() + VENTANA_DIAS);
+    const finReal = fin > hasta ? hasta : fin;
+
+    const gteCreatedAt = pm_formatDate_(desde);
+    const lteCreatedAt = pm_formatDate_(finReal);
+
+    ventana++;
+    Logger.log(PM_LOG_INC + ' Ventana ' + ventana + ': ' + gteCreatedAt + ' → ' + lteCreatedAt);
+    SpreadsheetApp.getActive().toast(
+      'Ventana ' + ventana + ' | Órdenes acumuladas: ' + totalOrders + ' | Buffer: ' + allRows.length,
+      'PM Incremental ⏳', 8
+    );
+
+    let offset         = 0;
+    let shouldContinue = true;
+
+    while (shouldContinue) {
+      const data = pm_fetchOrders_(gteCreatedAt, lteCreatedAt, offset);
+      const orders = (data && data.data) ? data.data : [];
+      if (!orders.length) break;
+
+      totalOrders += orders.length;
+
+      for (var i = 0; i < orders.length; i++) {
+        const rows = pm_buildRows_(orders[i], 'INCREMENTAL', existingKeys);
+        for (var j = 0; j < rows.length; j++) {
+          allRows.push(rows[j]);
+        }
+      }
+
+      if (orders.length < PM_PAGE_LIMIT) {
+        shouldContinue = false;
+      } else {
+        offset += PM_PAGE_LIMIT;
+        Utilities.sleep(PM_PACING_MS);
+      }
+    }
+
+    if (Date.now() - startTime > PM_MAX_MS) {
+      Logger.log(PM_LOG_INC + ' Timeout inminente — flush forzado en ventana ' + ventana);
+      flushRows_();
+    }
+
+    desde = fin;
+    Utilities.sleep(PM_PACING_MS);
+  }
+
+  flushRows_();
+
+  props.setProperty('PARIS_LAST_SYNC', hasta.toISOString());
+
+  const resumen = { ventanas: ventana, fetchedOrders: totalOrders, insertedRows: totalInserted };
+  Logger.log(PM_LOG_INC + ' Resumen: ' + JSON.stringify(resumen));
+  SpreadsheetApp.getActive().toast(
+    'PM incremental: ventanas=' + ventana + ' | órdenes=' + totalOrders + ' | filas=' + totalInserted,
+    'EHI', 7
+  );
+  return resumen;
+}
+
+
+// ── Fetch órdenes con ventana de fechas ─────────────────────────
+function pm_fetchOrders_(gteCreatedAt, lteCreatedAt, offset) {
+  try {
+    var path = '/v1/orders'
+      + '?limit=' + PM_PAGE_LIMIT
+      + '&offset=' + offset
+      + '&gteCreatedAt=' + encodeURIComponent(gteCreatedAt)
+      + '&lteCreatedAt=' + encodeURIComponent(lteCreatedAt);
+
+    return paris_fetchJson_(path, { method: 'get' });
+
+  } catch(e) {
+    Logger.log('[PM] pm_fetchOrders_ excepción: ' + e.message);
+    return { data: [] };
+  }
+}
+
+
+// ── Construir filas desde una orden (1 fila por SKU único por subOrden) ──
+function pm_buildRows_(order, modo, existingKeys) {
+  const rows      = [];
+  const subOrders = Array.isArray(order.subOrders) ? order.subOrders : [];
+
+  const orderNumber = String(order.originOrderNumber || order.id || '');
+  const orderId     = String(order.id || '');
+  const fechaVenta  = String(order.originOrderDate || order.createdAt || '');
+  const cliente     = String(order.customer && order.customer.name ? order.customer.name : '');
+
+  for (var s = 0; s < subOrders.length; s++) {
+    const sub         = subOrders[s];
+    const subNumber   = String(sub.subOrderNumber || '');
+    const subId       = String(sub.id || '');
+    const fulfillment = String(sub.fulfillment || '');
+    const statusName  = String(sub.status && sub.status.name ? sub.status.name : '');
+
+    const addr   = sub.shippingAddress || {};
+    const region = String(addr.stateCode || '');
+    const comuna = String(addr.city || '');
+    const direc  = String((addr.address1 || '') + (addr.address2 ? ' ' + addr.address2 : '')).trim();
+
+    const items = Array.isArray(sub.items) ? sub.items : [];
+
+    // ── Agrupar ítems por SKU dentro de la subOrden ──────────
+    // Paris puede devolver múltiples objetos con mismo SKU = cantidad > 1
+    const skuMap = {};  // skuMaestro → { item, cantidad }
+    for (var it = 0; it < items.length; it++) {
+      const item       = items[it];
+      const skuMaestro = String(item.sellerSku || '');
+      if (!skuMaestro) continue;
+
+      if (skuMap[skuMaestro]) {
+        skuMap[skuMaestro].cantidad++;
+      } else {
+        skuMap[skuMaestro] = { item: item, cantidad: 1 };
+      }
+    }
+
+    // ── Construir una fila por SKU agrupado ──────────────────
+    const skuKeys = Object.keys(skuMap);
+    for (var k = 0; k < skuKeys.length; k++) {
+      const skuMaestro = skuKeys[k];
+      const grupo      = skuMap[skuMaestro];
+      const item       = grupo.item;
+      const cantidad   = grupo.cantidad;
+
+      // Clave interna de deduplicación
+      const claveInterna = orderNumber + '|' + skuMaestro;
+      if (existingKeys.has(claveInterna)) continue;
+
+      const claveUnica  = orderNumber + '-' + subNumber;
+      const precioUnit  = parseFloat(item.basePrice           || 0);
+      const montoTotal  = parseFloat((precioUnit * cantidad).toFixed(0));
+      const cargoVenta  = parseFloat((montoTotal * PM_COMISION_RATE).toFixed(0));
+      const montoNeto   = parseFloat((montoTotal - cargoVenta).toFixed(0));
+
+      // Estado conciliación
+      let estadoConciliacion = '';
+      const st = statusName.toLowerCase();
+      if (st === 'cancelled' || st === 'canceled') {
+        estadoConciliacion = 'CANCELADA POR EL COMPRADOR';
+      } else if (st === 'returned') {
+        estadoConciliacion = 'DEVOLUCION CON REEMBOLSO';
+      } else if (modo === 'HISTORICO') {
+        estadoConciliacion = 'PENDIENTE_HISTORICO';
+      } else {
+        estadoConciliacion = 'PENDIENTE';
+      }
+
+      existingKeys.add(claveInterna);
+
+      rows.push([
+        new Date(),                                        // A fecha_ingesta
+        'PM',                                              // B canal
+        orderId,                                           // C pm_order_id
+        orderNumber,                                       // D pm_order_number
+        subNumber,                                         // E pm_suborder_number
+        subId,                                             // F pm_suborder_id
+        orderNumber + '-' + subNumber,                     // G id_venta_canal
+        fechaVenta,                                        // H fecha_venta
+        String(item.sku || ''),                            // I sku_canal
+        skuMaestro,                                        // J sku_maestro
+        skuMaestro.length > 2 ? skuMaestro.slice(0, -2) : skuMaestro, // K mpn
+        cantidad,                                          // L cantidad
+        precioUnit,                                        // M precio_unitario
+        montoTotal,                                        // N monto_total
+        cargoVenta,                                        // O cargo_venta
+        0,                                                 // P cargo_envio
+        montoNeto,                                         // Q monto_neto
+        fulfillment,                                       // R fulfillment_type
+        cliente,                                           // S cliente_nombre
+        region,                                            // T region
+        comuna,                                            // U comuna
+        direc,                                             // V direccion_resumen
+        statusName,                                        // W estado_pm
+        estadoConciliacion,                                // X estado_conciliacion
+        '',                                                // Y fecha_conciliacion
+        '',                                                // Z mensaje_conciliacion
+        claveUnica,                                        // AA clave_unica
+        false,                                             // AB existe_en_ventas
+        JSON.stringify({ order_id: orderId, sub: sub, item: item, cantidad: cantidad }) // AC json_raw
+      ]);
+    }
+  }
+  return rows;
+}
+
+
+// ── Helper: claves únicas existentes ───────────────────────────
+// Usa clave interna orderNumber|skuMaestro para deduplicación
+function pm_getExistingKeys_(sh) {
+  const set     = new Set();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return set;
+
+  // Lee cols D (pm_order_number=4) y J (sku_maestro=10)
+  const orderNums  = sh.getRange(2, 4, lastRow - 1, 1).getValues();
+  const skuMaestros = sh.getRange(2, 10, lastRow - 1, 1).getValues();
+
+  for (var i = 0; i < orderNums.length; i++) {
+    const on  = String(orderNums[i][0]  || '').trim();
+    const sku = String(skuMaestros[i][0] || '').trim();
+    if (on && sku) set.add(on + '|' + sku);
+  }
+  return set;
+}
+
+
+// ── Crear hoja Ventas PM si no existe ──────────────────────────
+function pm_crearHojaVentasPM_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh   = ss.getSheetByName(PM_SHEET_VENTAS);
+  if (sh) return sh;
+
+  sh = ss.insertSheet(PM_SHEET_VENTAS);
+  sh.getRange(1, 1, 1, PM_HEADERS.length).setValues([PM_HEADERS]);
+  sh.setFrozenRows(1);
+
+  // Formato fecha cols A(1) y H(8)
+  sh.getRange(2, 1, sh.getMaxRows() - 1, 1).setNumberFormat('dd/mm/yyyy hh:mm:ss');
+  sh.getRange(2, 8, sh.getMaxRows() - 1, 1).setNumberFormat('dd/mm/yyyy hh:mm:ss');
+
+  // Formato número cols M(13),N(14),O(15),R(18)
+  [13, 14, 15, 17].forEach(function(c) {
+    sh.getRange(2, c, sh.getMaxRows() - 1, 1).setNumberFormat('#,##0');
+  });
+
+  return sh;
+}
+
+
+// ── Normaliza fecha a formato YYYY-MM-DD para API Paris ────────
+function pm_formatDate_(date) {
+  const d = new Date(date);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return y + '-' + m + '-' + day;
+}
+
+// ===================================================================
+// VENTAS PM — Etapa 2: Conciliación
+// Cruza hoja "Ventas PM" contra hoja "Ventas" (fuente de verdad).
+// ===================================================================
+
+function pm_conciliar() {
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const shPm     = ss.getSheetByName(PM_SHEET_VENTAS);
+  const shVentas = ss.getSheetByName('Ventas');
+
+  if (!shPm)     throw new Error('No existe hoja "Ventas PM".');
+  if (!shVentas) throw new Error('No existe hoja "Ventas".');
+
+  SpreadsheetApp.getActive().toast('Conciliación PM iniciada...', 'EHI', 5);
+
+  // ── 1. Construir mapas hoja Ventas ────────────────────────────
+  const hVentas     = shVentas.getDataRange().getValues();
+  const hVentasHead = hVentas[0].map(function(h) {
+    return String(h).replace(/\n/g, '').trim();
+  });
+
+  const colNumVenta   = hVentasHead.indexOf('# Venta');
+  const colSku        = hVentasHead.indexOf('SKU');
+  const colPrecioV    = hVentasHead.indexOf('PrecioVenta');
+  const colCargosV    = hVentasHead.indexOf('Cargos porVenta');
+  const colCargoEnvio = hVentasHead.indexOf('Cargo porEnvío');
+  const colRecaudado  = hVentasHead.indexOf('Recaudado');
+
+  if ([colNumVenta, colSku, colPrecioV, colCargosV, colCargoEnvio, colRecaudado].includes(-1)) {
+    throw new Error('Faltan columnas requeridas en hoja Ventas. Verifica: # Venta, SKU, PrecioVenta, Cargos porVenta, Cargo porEnvío, Recaudado.');
+  }
+
+  const mapaVentasSimple    = {};  // # Venta → datos
+  const mapaVentasCompuesto = {};  // # Venta|SKU → datos
+
+  for (var r = 1; r < hVentas.length; r++) {
+    const numVenta = String(hVentas[r][colNumVenta]).trim();
+    if (!numVenta) continue;
+
+    const precioVenta = pm_parseNumber_(hVentas[r][colPrecioV]);
+    if (precioVenta < 0) continue;  // notas de crédito — se omiten
+
+    const sku   = String(hVentas[r][colSku]).trim();
+    const datos = {
+      precioVenta: precioVenta,
+      cargosVenta: pm_parseNumber_(hVentas[r][colCargosV]),
+      cargoEnvio:  pm_parseNumber_(hVentas[r][colCargoEnvio]),
+      recaudado:   pm_parseNumber_(hVentas[r][colRecaudado])
+    };
+
+    mapaVentasSimple[numVenta]                = datos;
+    mapaVentasCompuesto[numVenta + '|' + sku] = datos;
+  }
+
+  // ── 2. Leer hoja Ventas PM ────────────────────────────────────
+  const hPm   = shPm.getDataRange().getValues();
+  const mapPm = {};
+  hPm[0].forEach(function(h, i) { if (h) mapPm[String(h).trim()] = i; });
+
+  const COL_ORDER_NUMBER = mapPm['pm_suborder_number'];
+  const COL_SKU_MAESTRO  = mapPm['sku_maestro'];
+  const COL_MONTO_TOTAL  = mapPm['monto_total'];
+  const COL_CARGO_VENTA  = mapPm['cargo_venta'];
+  const COL_CARGO_ENVIO  = mapPm['cargo_envio'];
+  const COL_MONTO_NETO   = mapPm['monto_neto'];
+  const COL_ESTADO_CONC  = mapPm['estado_conciliacion'];
+  const COL_FECHA_CONC   = mapPm['fecha_conciliacion'];
+  const COL_MENSAJE_CONC = mapPm['mensaje_conciliacion'];
+
+  const ESTADOS_OMITIR = new Set([
+    'CANCELADA POR EL COMPRADOR', 'CONCILIADA',
+    'DIFERENCIA', 'DIFERENCIA_CONOCIDA', 'NO ENCONTRADA EN VENTAS'
+  ]);
+
+  const TOLERANCIA = 1;
+  let procesadas           = 0;
+  let conciliadas          = 0;
+  let diferencias          = 0;
+  let diferenciasConocidas = 0;
+  let noEncontradas        = 0;
+  const ahora              = new Date();
+
+  // ── 3. Procesar cada fila ─────────────────────────────────────
+  for (var i = 1; i < hPm.length; i++) {
+    const estadoConc = String(hPm[i][COL_ESTADO_CONC]).trim();
+    if (ESTADOS_OMITIR.has(estadoConc)) continue;
+
+    procesadas++;
+    const orderNumber = String(hPm[i][COL_ORDER_NUMBER]).trim();
+    const skuMaestro  = String(hPm[i][COL_SKU_MAESTRO]).trim();
+
+    // Búsqueda 2 niveles: compuesto → simple
+    const claveComp = orderNumber + '|' + skuMaestro;
+    const ventaRow  = mapaVentasCompuesto[claveComp] || mapaVentasSimple[orderNumber];
+
+    // ── No encontrada ─────────────────────────────────────────
+    if (!ventaRow) {
+      shPm.getRange(i + 1, COL_ESTADO_CONC  + 1).setValue('NO ENCONTRADA EN VENTAS');
+      shPm.getRange(i + 1, COL_FECHA_CONC   + 1).setValue(ahora);
+      shPm.getRange(i + 1, COL_MENSAJE_CONC + 1).setValue('# Sub-orden ' + orderNumber + ' no existe en hoja Ventas');
+      noEncontradas++;
+      continue;
+    }
+
+    // ── Comparar 4 campos con tolerancia ±$1 ─────────────────
+    const montoTotal = pm_parseNumber_(hPm[i][COL_MONTO_TOTAL]);
+    const cargoVenta = pm_parseNumber_(hPm[i][COL_CARGO_VENTA]);
+    const cargoEnvio = pm_parseNumber_(hPm[i][COL_CARGO_ENVIO]);
+    const montoNeto  = pm_parseNumber_(hPm[i][COL_MONTO_NETO]);
+
+    const diffs = [];
+    if (Math.abs(montoTotal - ventaRow.precioVenta) > TOLERANCIA)
+      diffs.push('monto_total: '  + montoTotal + ' vs ' + ventaRow.precioVenta);
+    if (Math.abs(cargoVenta - ventaRow.cargosVenta) > TOLERANCIA)
+      diffs.push('cargo_venta: '  + cargoVenta + ' vs ' + ventaRow.cargosVenta);
+    if (Math.abs(cargoEnvio - ventaRow.cargoEnvio)  > TOLERANCIA)
+      diffs.push('cargo_envio: '  + cargoEnvio + ' vs ' + ventaRow.cargoEnvio);
+    if (Math.abs(montoNeto  - ventaRow.recaudado)   > TOLERANCIA)
+      diffs.push('monto_neto: '   + montoNeto  + ' vs ' + ventaRow.recaudado);
+
+    let nuevoEstado, mensaje;
+
+    if (!diffs.length) {
+      nuevoEstado = 'CONCILIADA';
+      mensaje     = 'OK';
+      conciliadas++;
+    } else {
+      // Solo monto_neto difiere → cargo envío seller no disponible en API Paris
+      const soloNeto = diffs.every(function(d) { return d.indexOf('monto_neto') === 0; });
+      if (soloNeto) {
+        nuevoEstado = 'DIFERENCIA_CONOCIDA';
+        mensaje     = 'Posible cargo logístico PM (no disponible en API). ' + diffs.join(' | ');
+        diferenciasConocidas++;
+      } else {
+        nuevoEstado = 'DIFERENCIA';
+        mensaje     = diffs.join(' | ');
+        diferencias++;
+      }
+    }
+
+    shPm.getRange(i + 1, COL_ESTADO_CONC  + 1).setValue(nuevoEstado);
+    shPm.getRange(i + 1, COL_FECHA_CONC   + 1).setValue(ahora);
+    shPm.getRange(i + 1, COL_MENSAJE_CONC + 1).setValue(mensaje);
+  }
+
+  const resumen = {
+    procesadas: procesadas, conciliadas: conciliadas,
+    diferencias: diferencias, diferenciasConocidas: diferenciasConocidas,
+    noEncontradas: noEncontradas
+  };
+  Logger.log('[PM-CONC] Resumen: ' + JSON.stringify(resumen));
+  SpreadsheetApp.getActive().toast(
+    'PM conciliación: ' + procesadas + ' procesadas | ' +
+    conciliadas + ' ok | ' + diferencias + ' diff | ' +
+    diferenciasConocidas + ' diff_conocida | ' + noEncontradas + ' no encontradas',
+    'EHI', 10
+  );
+  return resumen;
+}
+
+
+// ── Helper: parsea número formato chileno o número directo ──────
+function pm_parseNumber_(val) {
+  if (val === null || val === undefined || val === '') return 0;
+  if (typeof val === 'number') return Math.round(val);
+  return parseInt(String(val).replace(/\./g, '').replace(/,/g, ''), 10) || 0;
+}
