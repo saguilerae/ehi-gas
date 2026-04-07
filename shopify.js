@@ -95,7 +95,11 @@ function syncShopifyProductsToSheet() {
   const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_NAME);
   if (!sheet) throw new Error(`No existe la hoja "${SHEET_NAME}"`);
 
-  sheet.appendRow(HEADERS);
+  // Solo escribe headers si la fila 1 está vacía
+  const existingHeader = sheet.getRange(1, 1).getValue();
+  if (!existingHeader) {
+    sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
+  }
 
   const products = fetchAllProducts(); // array de productos
 
@@ -153,8 +157,7 @@ function syncShopifyProductsToSheet() {
   });
 
   if (rows.length > 0) {
-    sheet.getRange(2, 1, rows.length, HEADERS.length).setValues(rows).clearContent()
-    sheet.getRange(2, 1, rows.length, HEADERS.length).setValues(rows);
+    sheet.getRange(2, 1, rows.length, HEADERS.length).clearContent().setValues(rows)
   }
 }
 
