@@ -265,48 +265,64 @@ function actualizarStockPM_desdeParametros_(skuSeller, stockNuevo) {
 // ===================================================================
 function actualizarStockSH_desdeParametros(skuObjetivo, stockNuevo) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName('Prods. Shopify');
+  const sheetName = (typeof SHEET_NAME !== 'undefined' && SHEET_NAME) ? SHEET_NAME : 'Prods. SH';
+  const sheet = ss.getSheetByName(sheetName);
 
   if (!sheet) {
-    throw new Error("No existe la hoja 'Prods. Shopify'.");
+    throw new Error("Shopify: no existe la hoja '" + sheetName + "'.");
   }
 
   const lastRow = sheet.getLastRow();
   const lastCol = sheet.getLastColumn();
 
   if (lastRow <= 1) {
-    throw new Error("La hoja 'Prods. Shopify' no tiene datos.");
+    throw new Error("Shopify: la hoja '" + sheetName + "' no tiene datos.");
+  }
+
+  const idx = getHeaderIndex_(sheet);
+
+  const colSku = idx['Variant SKU'];
+  const colInventoryItemId = idx['Inventory Item ID'];
+
+  if (colSku == null || colInventoryItemId == null) {
+    throw new Error(
+      "Shopify: faltan headers en '" + sheetName + "': Variant SKU o Inventory Item ID."
+    );
   }
 
   const data = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
 
-  let rowIndex = -1;
+  let inventoryItemId = '';
+
   for (let i = 0; i < data.length; i++) {
-    if (String(data[i][1] || '').trim() === String(skuObjetivo).trim()) {
-      rowIndex = i;
+    const skuRow = String(data[i][colSku] || '').trim();
+
+    if (skuRow === String(skuObjetivo).trim()) {
+      inventoryItemId = data[i][colInventoryItemId];
       break;
     }
   }
 
-  if (rowIndex === -1) {
-    throw new Error("Shopify: SKU no encontrado en 'Prods. Shopify': " + skuObjetivo);
-  }
-
-  const inventoryItemId = data[rowIndex][12]; // col M
   if (!inventoryItemId) {
-    throw new Error('Shopify: falta Inventory Item ID para SKU ' + skuObjetivo);
+    throw new Error("Shopify: SKU no encontrado o sin Inventory Item ID: " + skuObjetivo);
   }
 
   const scriptProps = PropertiesService.getScriptProperties();
   const locationIdStr = scriptProps.getProperty('SHOPIFY_LOCATION_ID');
 
   if (!locationIdStr) {
-    throw new Error('Falta SHOPIFY_LOCATION_ID en Script Properties.');
+    throw new Error('Shopify: falta SHOPIFY_LOCATION_ID en Script Properties.');
   }
 
-  actualizarStockShopify_(inventoryItemId, Number(locationIdStr), stockNuevo);
-}
+  Logger.log(
+    '[SH][STOCK] sku=' + skuObjetivo +
+    ' inventory_item_id=' + inventoryItemId +
+    ' location_id=' + locationIdStr +
+    ' stock=' + stockNuevo
+  );
 
+  actualizarStockShopify_(inventoryItemId, Number(locationIdStr), Number(stockNuevo));
+}
 
 // ===================================================================
 // Shopify API call
