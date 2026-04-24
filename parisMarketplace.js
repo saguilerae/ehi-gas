@@ -586,11 +586,10 @@ function paris_updatePriceOffer_fromSheet() {
 
 
 // =========================
-//  ACTUALIZAR STOCK (desde "Copia de Prods. PM")
-//  - Respeta: NO tocar J:M
+//  ACTUALIZAR STOCK (desde "Prods. PM")
 //  - Usa: columna A "Actualizar" (checkbox)
-//  - Input: "nuevo_stock" (NO pisa "stock" directamente)
-//  - Si OK: copia nuevo_stock -> stock y desmarca Actualizar
+//  - Input: columna "stock"
+//  - Si OK: desmarca Actualizar
 // =========================
 function paris_updateStock_fromSheet() {
   const ss = SpreadsheetApp.getActive();
@@ -603,23 +602,22 @@ function paris_updateStock_fromSheet() {
   const colSkuMkp = hm['sku_mkp'];
   const colSkuSeller = hm['sku_seller'];
   const colStock = hm['stock'];
-  const colNuevoStock = hm['nuevo_stock'];
 
-  if (!colActualizar || !colSkuMkp || !colSkuSeller || !colStock || !colNuevoStock) {
-    throw new Error('Headers faltantes en ' + SHEET_PRODS + '. Revisa: Actualizar, sku_mkp, sku_seller, stock, nuevo_stock');
+  if (!colActualizar || !colSkuMkp || !colSkuSeller || !colStock) {
+    throw new Error('Headers faltantes en ' + SHEET_PRODS + '. Revisa: Actualizar, sku_mkp, sku_seller, stock');
   }
 
   const lastRow = sh.getLastRow();
   if (lastRow < 2) return;
 
-  const readCols = Math.min(9, sh.getLastColumn()); // A:I
+  const readCols = Math.min(8, sh.getLastColumn()); // A:H, sin nuevo_stock
   const range = sh.getRange(2, 1, lastRow - 1, readCols);
   const values = range.getValues();
 
   const warehouse = paris_getWarehouse_();
 
-  const items = [];      // {idx, nuevoStock}
-  const skusPayload = []; // [{sku, sku_seller, quantity, warehouse}, ...]
+  const items = [];
+  const skusPayload = [];
 
   for (let i = 0; i < values.length; i++) {
     const row = values[i];
@@ -628,17 +626,23 @@ function paris_updateStock_fromSheet() {
 
     const skuMkp = row[colSkuMkp - 1];
     const skuSeller = row[colSkuSeller - 1];
-    const nuevoStock = toNumber_(row[colNuevoStock - 1]);
+    const stock = toNumber_(row[colStock - 1]);
 
     if (!skuMkp || !skuSeller) continue;
-    if (nuevoStock === null) throw new Error('Fila ' + (i + 2) + ': nuevo_stock inválido');
+    if (stock === null) throw new Error('Fila ' + (i + 2) + ': stock inválido');
 
-    items.push({ idx: i, nuevoStock });
+    Logger.log(
+      '[PARIS][STOCK] SKU=' + skuMkp +
+      ' SELLER=' + skuSeller +
+      ' new=' + stock
+    );
+
+    items.push({idx: i});
 
     skusPayload.push({
       sku: String(skuMkp),
       sku_seller: String(skuSeller),
-      quantity: nuevoStock,
+      quantity: stock,
       warehouse: warehouse
     });
   }
@@ -648,20 +652,17 @@ function paris_updateStock_fromSheet() {
     return;
   }
 
-  // ✅ Ejecutar con auto-fallback (usa tu función nueva)
   paris_postStockInChunks_(skusPayload);
 
-  // Aplicar cambios en memoria
   for (let k = 0; k < items.length; k++) {
-    const { idx, nuevoStock } = items[k];
-    values[idx][colStock - 1] = nuevoStock;
+    const { idx } = items[k];
     values[idx][colActualizar - 1] = false;
   }
 
   range.setValues(values);
 
   paris_timingReport_();
-  ss.toast('Stock actualizado en "' + SHEET_PRODS + '": ' + items.length + ' variantes.', 'Paris', 5);
+  ss.toast('Stock actualizado en "' + SHEET_PRODS + '": ' + items.length + ' variantes. Puede tardar algunos minutos en reflejarse para consultar.', 'Paris', 5);
 }
 
 // =========================
@@ -681,16 +682,16 @@ function paris_runAll_fetchs() {
 }
 
 // =========================
-//  CONSULTAR PRODUCTOS (mapear SKU mkp variante + skuSeller) -> "Copia de Prods. PM"
-//  - No toca J:M
-//  - Inserta/actualiza filas por sku_mkp (SKU marketplace variante, ej MK...-1)
+//  CONSULTAR PRODUCTOS (mapear SKU mkp variante + skuSeller) -> "Prods. PM"
+//  - Inserta/actualiza filas por sku_mkp
+//  - Mantiene stock real desde Paris en columna stock
+//  - Ya no usa columna nuevo_stock
 // =========================
 function paris_fetchProducts_mapSkus() {
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(SHEET_PRODS);
   if (!sh) throw new Error('No existe hoja: ' + SHEET_PRODS);
 
-  // Validar headers por nombre (si falta alguno, mejor fallar explícito)
   const hm = sheet_getHeaderMap_(sh);
 
   const colActualizar  = hm['Actualizar'];
@@ -701,47 +702,51 @@ function paris_fetchProducts_mapSkus() {
   const colEstado      = hm['estado_de_variante_de_producto'];
   const colFulfillment = hm['fulfillment'];
   const colStock       = hm['stock'];
-  const colNuevoStock  = hm['nuevo_stock'];
 
-  const need = ['Actualizar','sku_mkp','sku_seller','titulo','talla','estado_de_variante_de_producto','fulfillment','stock','nuevo_stock'];
+  const need = [
+    'Actualizar',
+    'sku_mkp',
+    'sku_seller',
+    'titulo',
+    'talla',
+    'estado_de_variante_de_producto',
+    'fulfillment',
+    'stock'
+  ];
+
   const missing = need.filter(k => !hm[k]);
   if (missing.length) {
     throw new Error('Headers faltantes en "' + SHEET_PRODS + '": ' + missing.join(', '));
   }
 
-  // --- Preservar stock/nuevo_stock existentes por sku_mkp ---
   const lastRow = sh.getLastRow();
-  const readCols = 9; // A:I (no tocar J:M)
+  const readCols = 8; // A:H, sin nuevo_stock
+
   const existing = (lastRow >= 2)
     ? sh.getRange(2, 1, lastRow - 1, readCols).getValues()
     : [];
 
-  const keepBySku = {}; // sku_mkp(norm) -> {stock, nuevo}
+  const keepBySku = {};
+
   for (let i = 0; i < existing.length; i++) {
     const skuRaw = existing[i][colSkuMkp - 1];
     if (!skuRaw) continue;
 
     const k = paris_normSkuMkp_(skuRaw);
-
-    // OJO: si hay duplicados, conserva el que tenga algún valor
-    const prev = keepBySku[k];
     const stockVal = existing[i][colStock - 1];
-    const nuevoVal = existing[i][colNuevoStock - 1];
 
-    if (!prev) {
-      keepBySku[k] = { stock: stockVal, nuevo: nuevoVal };
+    if (!keepBySku[k]) {
+      keepBySku[k] = { stock: stockVal };
     } else {
-      // no pisar valores existentes con vacío
-      if ((prev.stock === '' || prev.stock == null) && (stockVal !== '' && stockVal != null)) prev.stock = stockVal;
-      if ((prev.nuevo === '' || prev.nuevo == null) && (nuevoVal !== '' && nuevoVal != null)) prev.nuevo = nuevoVal;
+      if ((keepBySku[k].stock === '' || keepBySku[k].stock == null) && stockVal !== '' && stockVal != null) {
+        keepBySku[k].stock = stockVal;
+      }
     }
   }
 
-  // --- Traer productos (paginado) ---
   const outRows = [];
   let offset = 0;
-  const allSkuSellers = [];
-  const limit = 100; // más rápido que 50
+  const limit = 100;
 
   while (true) {
     const path = PARIS_ENDPOINTS.PRODUCTS_SEARCH + '?limit=' + limit + '&offset=' + offset;
@@ -755,12 +760,10 @@ function paris_fetchProducts_mapSkus() {
       const variants = Array.isArray(prod.variants) ? prod.variants : [];
 
       for (const v of variants) {
-        const skuMkp = v.sku;          // variante (MK...-1)
+        const skuMkp = v.sku;
         if (!skuMkp) continue;
-        
-        const skuSeller = v.skuSeller; // sku_seller
-        if (skuSeller) allSkuSellers.push(String(skuSeller).trim());
 
+        const skuSeller = v.skuSeller;
         const fulfillment = paris_pickFulfillment_(prod, v);
 
         let talla = '';
@@ -772,10 +775,9 @@ function paris_fetchProducts_mapSkus() {
         const estado = v.statusApproval || v.status || '';
 
         const keepKey = paris_normSkuMkp_(skuMkp);
-        const keep = keepBySku[keepKey] || { stock: '', nuevo: '' };
+        const keep = keepBySku[keepKey] || { stock: '' };
 
-        // Construimos EXACTO A:I respetando tus columnas
-        const row = new Array(9).fill('');
+        const row = new Array(8).fill('');
         row[colActualizar - 1]  = false;
         row[colSkuMkp - 1]      = skuMkp;
         row[colSkuSeller - 1]   = skuSeller || '';
@@ -784,36 +786,32 @@ function paris_fetchProducts_mapSkus() {
         row[colEstado - 1]      = estado;
         row[colFulfillment - 1] = fulfillment;
         row[colStock - 1]       = keep.stock;
-        row[colNuevoStock - 1]  = keep.nuevo;
 
         outRows.push(row);
       }
     }
 
-
     offset += limit;
     if (data.total !== undefined && offset >= Number(data.total)) break;
   }
 
-  // --- Traer stock real desde API (v2/stock) y aplicar a outRows ---
-  const stockBySku = paris_fetchAllStockMap_(200); // prueba 300; si se pone lento o falla usa a 100/200/100
+  const stockBySku = paris_fetchAllStockMap_(200);
+
   for (let i = 0; i < outRows.length; i++) {
     const skuMkp = outRows[i][colSkuMkp - 1];
     const k = paris_normSkuMkp_(skuMkp);
     if (k in stockBySku) outRows[i][colStock - 1] = stockBySku[k];
   }
 
-  // --- Refrescar SOLO A:I (mantiene J:M intacto) ---
-  // Limpia contenido previo A:I desde fila 2 (sin tocar headers)
-  const newLast = outRows.length + 1;
-  if (lastRow > 1) sh.getRange(2, 1, lastRow - 1, 9).clearContent();
+  if (lastRow > 1) {
+    sh.getRange(2, 1, lastRow - 1, readCols).clearContent();
+  }
 
   if (outRows.length) {
-    sh.getRange(2, 1, outRows.length, 9).setValues(outRows);
-    // Reponer checkboxes en columna A (Actualizar) para el rango nuevo
+    sh.getRange(2, 1, outRows.length, readCols).setValues(outRows);
     sh.getRange(2, colActualizar, outRows.length, 1).insertCheckboxes();
   }
-  
+
   paris_timingReport_();
   ss.toast('Actualización de Productos en "' + SHEET_PRODS + '": ' + outRows.length + ' variantes.', 'Paris', 5);
   Logger.log('Productos/variantes escritos: ' + outRows.length);
