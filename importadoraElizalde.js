@@ -50,6 +50,98 @@ function registrarVenta() {
 }
 
 // ===================================================================
+// Función: Consulta todos los stocks multicanal
+// Orden:
+// 1) Shopify
+// 2) Paris
+// 3) Falabella
+// 4) Mercado Libre
+// ===================================================================
+function consultaTodosStock() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const pasos = [
+    {
+      canal: 'Shopify',
+      fnName: 'syncShopifyProductsToSheet'
+    },
+    {
+      canal: 'Paris',
+      fnName: 'paris_fetchProducts_mapSkus'
+    },
+    {
+      canal: 'Falabella',
+      fnName: 'consultaProdsFS'
+    },
+    {
+      canal: 'Mercado Libre',
+      fnName: 'consultaProdsML'
+    }
+  ];
+
+  const resultados = [];
+
+  ss.toast('Iniciando consulta de stocks multicanal...', 'EHI', 5);
+  Logger.log('[EHI][STOCKS] Inicio consultaTodosStock');
+
+  for (let i = 0; i < pasos.length; i++) {
+    const paso = pasos[i];
+
+    try {
+      if (typeof this[paso.fnName] !== 'function') {
+        throw new Error('No existe función: ' + paso.fnName);
+      }
+
+      ss.toast('Consultando stock: ' + paso.canal + '...', 'EHI', 5);
+      Logger.log('[EHI][STOCKS] Inicio ' + paso.canal + ' -> ' + paso.fnName);
+
+      this[paso.fnName]();
+
+      SpreadsheetApp.flush();
+
+      resultados.push({
+        canal: paso.canal,
+        estado: 'OK'
+      });
+
+      Logger.log('[EHI][STOCKS] OK ' + paso.canal);
+      ss.toast('Finalizó consulta: ' + paso.canal, 'EHI', 4);
+
+      Utilities.sleep(1500);
+
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+
+      resultados.push({
+        canal: paso.canal,
+        estado: 'ERROR',
+        detalle: msg
+      });
+
+      Logger.log('[EHI][STOCKS] ERROR ' + paso.canal + ': ' + msg);
+
+      ss.toast('Error consultando ' + paso.canal + '. Revisa logs.', 'EHI', 8);
+
+      // Continúa con el siguiente marketplace
+      Utilities.sleep(1500);
+    }
+  }
+
+  const ok = resultados.filter(r => r.estado === 'OK').length;
+  const err = resultados.filter(r => r.estado === 'ERROR').length;
+
+  Logger.log('[EHI][STOCKS] Resumen consultaTodosStock: ' + JSON.stringify(resultados));
+
+  ss.toast(
+    'Consulta stocks finalizada: ' + ok + ' OK / ' + err + ' error(es).',
+    'EHI',
+    8
+  );
+
+  return resultados;
+}
+
+// ===================================================================
 // Función: calcula el saldo banco
 // ===================================================================
 function calculaSaldo() {

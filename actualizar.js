@@ -133,7 +133,7 @@ function skuExisteEnCanal_(canal, sku) {
       return existeSkuEnHoja_(ss.getSheetByName('Prods. FSC'), 2, skuNorm);
 
     case 'SH':
-      return existeSkuEnHoja_(ss.getSheetByName('Prods. Shopify'), 2, skuNorm);
+      return existeSkuEnHoja_(ss.getSheetByName('Prods. SH'), 2, skuNorm);
 
     case 'PM': {
       const sh = ss.getSheetByName((typeof SHEET_PRODS !== 'undefined' && SHEET_PRODS) ? SHEET_PRODS : 'Prods. PM');

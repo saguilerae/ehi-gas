@@ -3,6 +3,8 @@ function onOpen() {
   ui.createMenu('Importadora Elizalde')
       .addItem('Registrar Venta', 'registrarVenta')
       .addSeparator()
+      .addItem('Consultar todos los Stocks', 'consultaTodosStock')
+      .addSeparator()
       .addItem('Recalcular Saldo', 'calculaSaldo')
       .addSeparator()
       .addItem('Generar Respaldo', 'respaldoImportadoraElizalde')

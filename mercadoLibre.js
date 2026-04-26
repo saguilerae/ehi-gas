@@ -350,7 +350,7 @@ function consultaProdsML() {
   }
 
   try { limpiaFiltro('Prods. MLC'); } catch (e) {}
-  try { setPage(); } catch (e) {}
+  // try { setPage(); } catch (e) {}
   try { creaFiltro('Prods. MLC', 1); } catch (e) {}
 
   SpreadsheetApp.getActive().toast(
