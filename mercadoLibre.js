@@ -80,43 +80,81 @@ function meliEnsureAccessToken_() {
   return refreshed;
 }
 
+// Esta función se usa en meliApiFetch_()
+function meliSleepBackoff_(attempt) {
+  const ms = Math.min(30000, 1000 * Math.pow(2, attempt)) + Math.floor(Math.random() * 500);
+  Utilities.sleep(ms);
+}
+
 
 function meliApiFetch_(url, options, retryOn401) {
-  const shouldRetry = retryOn401 !== false;
+  const shouldRetry401 = retryOn401 !== false;
   let accessToken = meliEnsureAccessToken_();
 
-  const finalOptions = Object.assign({}, options || {});
-  finalOptions.method = finalOptions.method || 'get';
-  finalOptions.muteHttpExceptions = true;
-  finalOptions.headers = meliBuildHeaders_(accessToken, finalOptions.headers || {});
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const finalOptions = Object.assign({}, options || {});
+    finalOptions.method = finalOptions.method || 'get';
+    finalOptions.muteHttpExceptions = true;
+    finalOptions.headers = meliBuildHeaders_(accessToken, finalOptions.headers || {});
 
-  let response = UrlFetchApp.fetch(url, finalOptions);
+    try {
+      let response = UrlFetchApp.fetch(url, finalOptions);
+      const code = response.getResponseCode();
 
-  if (response.getResponseCode() === 401 && shouldRetry) {
-    Logger.log('[MELI] 401 detectado. Intentando refresh token...');
-    refreshMeliTokens();
+      if (code === 401 && shouldRetry401 && attempt === 0) {
+        Logger.log('[MELI] 401 detectado. Intentando refresh token...');
+        refreshMeliTokens();
+        accessToken = meliEnsureAccessToken_();
+        continue;
+      }
 
-    accessToken = meliEnsureAccessToken_();
-    finalOptions.headers = meliBuildHeaders_(accessToken, (options && options.headers) || {});
-    response = UrlFetchApp.fetch(url, finalOptions);
+      if ((code === 429 || code >= 500) && attempt < 4) {
+        Logger.log('[MELI] Retry HTTP ' + code + ' intento=' + attempt);
+        meliSleepBackoff_(attempt);
+        continue;
+      }
+
+      return response;
+
+    } catch (e) {
+      const msg = String(e && e.message ? e.message : e);
+      const isQuota =
+        msg.indexOf('Se superó la cuota de ancho de banda') >= 0 ||
+        msg.indexOf('Bandwidth quota exceeded') >= 0 ||
+        msg.indexOf('rate of data transfer') >= 0 ||
+        msg.indexOf('Service invoked too many times') >= 0;
+
+      if (isQuota && attempt < 4) {
+        Logger.log('[MELI] Retry cuota GAS intento=' + attempt + ' msg=' + msg);
+        meliSleepBackoff_(attempt);
+        continue;
+      }
+
+      throw e;
+    }
   }
 
-  return response;
+  throw new Error('MELI fetch falló tras reintentos: ' + url);
 }
 
 
 function meliApiFetchAll_(requests) {
-  const accessToken = meliEnsureAccessToken_();
+  const responses = [];
+  const list = requests || [];
 
-  const finalRequests = (requests || []).map(function(req) {
-    const cloned = Object.assign({}, req);
-    cloned.method = cloned.method || 'get';
-    cloned.muteHttpExceptions = true;
-    cloned.headers = meliBuildHeaders_(accessToken, cloned.headers || {});
-    return cloned;
-  });
+  for (let i = 0; i < list.length; i++) {
+    const req = Object.assign({}, list[i]);
+    const url = req.url;
+    delete req.url;
 
-  return UrlFetchApp.fetchAll(finalRequests);
+    responses.push(meliApiFetch_(url, req, true));
+
+    if (i < list.length - 1) {
+      Utilities.sleep(1200);
+    }
+  }
+
+  return responses;
 }
 
 
@@ -199,6 +237,7 @@ function consultaProdsML() {
 
     if (body.scroll_id && body.results && body.results.length > 0) {
       scrollId = body.scroll_id;
+      Utilities.sleep(700);
     } else {
       hasMore = false;
     }
@@ -209,8 +248,8 @@ function consultaProdsML() {
     return;
   }
 
-  const IDS_PER_REQ = 20;
-  const REQS_PER_WAVE = 10;
+  const IDS_PER_REQ = 5;
+  const REQS_PER_WAVE = 1;
   const ATTRS = 'id,title,status,price,available_quantity,attributes,variations';
   const requests = [];
 
@@ -322,7 +361,7 @@ function consultaProdsML() {
       }
     }
 
-    Utilities.sleep(150);
+    Utilities.sleep(700);
   }
 
   data.sort(function(a, b) {
@@ -1154,7 +1193,7 @@ function ingestarVentasMLC_(opts) {
       shouldContinue = false;
     } else {
       offset += MLC_PAGE_LIMIT;
-      Utilities.sleep(150);
+      Utilities.sleep(1200);
     }
   }
 
