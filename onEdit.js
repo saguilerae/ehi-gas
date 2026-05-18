@@ -8,11 +8,11 @@ function onEdit(e) {
       var value = range.getValue();
       var validationRange;      
       if (value === "Variable") {
-        validationRange = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("F. Egresos").getRange("C3:C9");
+        validationRange = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Parámetros").getRange("I2:I8");
       } else if (value === "Fijo") {
-        validationRange = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("F. Egresos").getRange("C19:C23");
+        validationRange = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Parámetros").getRange("H2:H7");
       } else if (value === "Inversiones") {
-        validationRange = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("F. Inversiones").getRange("C3:C7");
+        validationRange = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Parámetros").getRange("J2:J6");
       }
       // Establece la validación de datos en la columna M de la misma fila
       if (validationRange) {
@@ -32,18 +32,17 @@ function onEdit(e) {
 /* Crea la validación de datos para todas las filas de la hoja Cta. Banco, columna M: tipo (13) */
 function crearValidacionDeDatos() {
   var hojaBanco = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Cta. Banco");
-  var hojaEgresos = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("F. Egresos");
-  var hojaInversiones = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("F. Inversiones");
+  var hojaParametros = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Parámetros");
   var lastRow = hojaBanco.getLastRow();
   for (var i = 6; i <= lastRow; i++) {
     var celdaL = hojaBanco.getRange("L" + i).getValue();
     var rangoValidacion = null;
     if (celdaL === "Variable") {
-      rangoValidacion = hojaEgresos.getRange("C3:C7");
+      rangoValidacion = hojaParametros.getRange("I2:I8");
     } else if (celdaL === "Fijo") {
-      rangoValidacion = hojaEgresos.getRange("C19:C22");
+      rangoValidacion = hojaParametros.getRange("H2:H7");
     } else if (celdaL === "Inversiones") {
-      rangoValidacion = hojaInversiones.getRange("C3:C6");
+      rangoValidacion = hojaParametros.getRange("J2:J6");
     }    
     if (rangoValidacion) {
       var reglaValidacion = SpreadsheetApp.newDataValidation()
